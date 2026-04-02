@@ -111,7 +111,9 @@ def maybe_reexec_with_strict_repro(
     env[STRICT_REEXEC_MARKER] = "1"
 
     cmd = [exe, str(script_path), *args]
-    print("INFO: strict reproducibility enabled; relaunching with PYTHONHASHSEED=0")
+    cmdline = subprocess.list2cmdline(cmd)
+    print("INFO: strict reproducibility enabled; relaunching with PYTHONHASHSEED=0", flush=True)
+    print(f"INFO: relaunch command: {cmdline}", flush=True)
     try:
         return subprocess.call(cmd, env=env)
     except OSError:

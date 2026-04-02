@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 from .benchmark import build_standard_matrix, evaluate_acceptance_gates, run_benchmark_matrix, summarize_by_board
@@ -117,10 +118,28 @@ def main(argv=None) -> int:
         metrics_by_mode = {}
         summary_by_mode = {}
         reasons_by_mode = {}
+        t_bench_start = time.perf_counter()
+
+        print("=" * 68)
+        print("ITERATION 10 A/B BENCHMARK")
+        print("=" * 68)
+        print(f"Input image: {img}")
+        print(f"Output dir:  {out_root}")
+        print(f"Modes:       {', '.join(args.modes)}")
+        print(f"Boards:      {', '.join(args.boards)}")
+        print(f"Seeds:       {', '.join(str(s) for s in args.seeds)}")
+        print(f"Strict repro: {bool(args.strict_repro)}")
+        print(f"Deterministic order: {args.deterministic_order}")
+        if args.repair_global_cap_s is not None:
+            print(f"Repair global cap override: {args.repair_global_cap_s}s")
 
         for mode in args.modes:
+            mode_t0 = time.perf_counter()
             mode_out = out_root / mode
             ensure_output_dir(mode_out)
+            print("\n" + "-" * 68)
+            print(f"[Mode: {mode}] start  out={mode_out}")
+            print("-" * 68)
             runtime = RuntimeConfig(
                 paths=PathsConfig(repo_root=defaults.repo_root, img=img, out_dir=mode_out),
                 verbose=bool(args.verbose),
@@ -134,6 +153,7 @@ def main(argv=None) -> int:
             metrics_by_mode[mode] = metrics
             summary_by_mode[mode] = summarize_by_board(metrics, metric_keys)
             reasons_by_mode[mode] = _collect_reason_counts(metrics)
+            print(f"[Mode: {mode}] complete in {time.perf_counter() - mode_t0:.1f}s")
 
         gates = {}
         if "fast" in summary_by_mode and "legacy" in summary_by_mode:
@@ -159,6 +179,7 @@ def main(argv=None) -> int:
         _write_summary_csv(summary_csv, summary_by_mode, gates)
         print(f"Saved benchmark summary JSON: {summary_json}")
         print(f"Saved benchmark summary CSV:  {summary_csv}")
+        print(f"Benchmark total elapsed: {time.perf_counter() - t_bench_start:.1f}s")
         if gates:
             print(f"Gate overall pass: {gates.get('overall_pass')}")
             if gates.get("failed_checks"):
