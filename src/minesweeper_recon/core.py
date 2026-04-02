@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 from PIL import Image as PILImage
 from scipy.ndimage import convolve, gaussian_filter, sobel
@@ -40,15 +42,32 @@ def compute_edge_weights(target, boost=4.0, sigma=1.0):
     return (1.0 + boost * mag).astype(np.float32)
 
 
+@lru_cache(maxsize=16)
+def _neighbor_table(H: int, W: int):
+    table = []
+    for y in range(H):
+        row = []
+        for x in range(W):
+            cell = []
+            for dy in range(-1, 2):
+                for dx in range(-1, 2):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < H and 0 <= nx < W:
+                        cell.append((ny, nx))
+            row.append(tuple(cell))
+        table.append(tuple(row))
+    return tuple(table)
+
+
+def get_neighbor_table(H: int, W: int):
+    return _neighbor_table(int(H), int(W))
+
+
 def nbrs(y, x, H, W):
     """Yield valid 8-neighbors of (y,x)."""
-    for dy in range(-1, 2):
-        for dx in range(-1, 2):
-            if dy == 0 and dx == 0:
-                continue
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < H and 0 <= nx < W:
-                yield ny, nx
+    return get_neighbor_table(H, W)[y][x]
 
 
 def assert_board_valid(grid, forbidden, label=""):

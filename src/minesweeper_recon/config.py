@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 
 def default_repo_root() -> Path:
@@ -39,6 +39,10 @@ class BoardConfig:
 class RuntimeConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     verbose: bool = True
+    solver_mode: Literal["legacy", "fast"] = "fast"
+    strict_repro: bool = True
+    deterministic_order: Literal["auto", "on", "off"] = "auto"
+    repair_global_cap_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,18 @@ def default_boards() -> list[BoardConfig]:
     ]
 
 
-def default_run_config(paths: PathsConfig | None = None, verbose: bool = True) -> RunConfig:
-    runtime = RuntimeConfig(paths=paths or PathsConfig(), verbose=verbose)
+def default_run_config(
+    paths: PathsConfig | None = None,
+    verbose: bool = True,
+    solver_mode: Literal["legacy", "fast"] = "fast",
+    strict_repro: bool = True,
+    deterministic_order: Literal["auto", "on", "off"] = "auto",
+) -> RunConfig:
+    runtime = RuntimeConfig(
+        paths=paths or PathsConfig(),
+        verbose=verbose,
+        solver_mode=solver_mode,
+        strict_repro=strict_repro,
+        deterministic_order=deterministic_order,
+    )
     return RunConfig(runtime=runtime, boards=default_boards())

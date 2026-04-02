@@ -13,6 +13,8 @@ from minesweeper_recon.config import PathsConfig, default_run_config
 from minesweeper_recon.preflight import (
     check_required_modules_or_raise,
     configure_mplconfigdir,
+    enforce_strict_repro_or_raise,
+    maybe_reexec_with_strict_repro,
     ensure_output_dir,
     parse_args,
     resolve_paths,
@@ -29,8 +31,32 @@ def main(argv=None) -> int:
     )
 
     try:
+        raw_argv = list(argv) if argv is not None else sys.argv[1:]
         args = parse_args(defaults, argv=argv)
         paths = resolve_paths(args, defaults)
+        strict_repro = bool(args.strict_repro)
+        reexec_code = maybe_reexec_with_strict_repro(
+            strict_repro=strict_repro,
+            script_path=SCRIPT_PATH,
+            argv=raw_argv,
+            python_executable=Path(sys.executable),
+        )
+        if reexec_code is not None:
+            return int(reexec_code)
+        enforce_strict_repro_or_raise(
+            strict_repro=strict_repro,
+            script_path=SCRIPT_PATH,
+            argv=raw_argv,
+            python_executable=Path(sys.executable),
+        )
+
+        if paths.out_dir == defaults.out_dir.resolve():
+            paths = PathsConfig(
+                repo_root=paths.repo_root,
+                img=paths.img,
+                out_dir=paths.out_dir / args.solver_mode,
+            )
+
         check_required_modules_or_raise()
         validate_image_path(paths.img)
         configure_mplconfigdir()
@@ -38,7 +64,13 @@ def main(argv=None) -> int:
 
         from minesweeper_recon.pipeline import run_experiment
 
-        run_config = default_run_config(paths=paths, verbose=True)
+        run_config = default_run_config(
+            paths=paths,
+            verbose=True,
+            solver_mode=args.solver_mode,
+            strict_repro=strict_repro,
+            deterministic_order=args.deterministic_order,
+        )
         run_experiment(run_config)
         return 0
     except DependencyError as exc:

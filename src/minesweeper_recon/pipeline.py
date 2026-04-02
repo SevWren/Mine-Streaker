@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
+from typing import Callable
 
 import numpy as np
 from PIL import Image as PILImage
@@ -15,12 +17,100 @@ from .repair_phase1 import run_phase1_repair
 from .repair_phase2 import run_phase2_swap_repair
 from .repair_phase3 import run_phase3_enumeration
 from .report import render_report
+from .runtime import build_repro_fingerprint
 from .sa import compile_sa_kernel
 from .solver import solve_board
 
 
-def _solve_fn(grid: np.ndarray, deadline_s=None):
-    return solve_board(grid, deadline_s=deadline_s)
+def _clamp_int(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(value)))
+
+
+def _resolve_deterministic_enabled(runtime: RuntimeConfig) -> bool:
+    if runtime.deterministic_order == "on":
+        return True
+    if runtime.deterministic_order == "off":
+        return False
+    return bool(runtime.strict_repro)
+
+
+def _make_solve_fn(runtime: RuntimeConfig) -> tuple[Callable[[np.ndarray, float | None], object], dict[str, float | int], bool]:
+    mode = runtime.solver_mode
+    deterministic = _resolve_deterministic_enabled(runtime)
+    solve_stats: dict[str, float | int] = {
+        "sort_calls": 0,
+        "sort_items": 0,
+        "sort_time_s": 0.0,
+    }
+
+    def _solve_fn(grid: np.ndarray, deadline_s=None):
+        sr = solve_board(
+            grid,
+            deadline_s=deadline_s,
+            mode=mode,
+            deterministic=deterministic,
+        )
+        solve_stats["sort_calls"] = int(solve_stats["sort_calls"]) + int(getattr(sr, "sort_calls", 0))
+        solve_stats["sort_items"] = int(solve_stats["sort_items"]) + int(getattr(sr, "sort_items", 0))
+        solve_stats["sort_time_s"] = float(solve_stats["sort_time_s"]) + float(getattr(sr, "sort_time_s", 0.0))
+        return sr
+
+    return _solve_fn, solve_stats, deterministic
+
+
+def _compute_adaptive_repair_budgets(
+    *,
+    n_unknown_pre: int,
+    solve_s0: float,
+    phase1_base: float,
+    phase2_base: float,
+    repair_global_cap_s: float,
+) -> dict[str, float]:
+    phase1_target_solves = _clamp_int(round(n_unknown_pre * 0.035), 8, 48)
+    phase2_target_solves = _clamp_int(round(n_unknown_pre * 0.028), 8, 40)
+    solve_ref = max(0.05, float(solve_s0))
+
+    phase1_need = phase1_target_solves * solve_ref * 1.20
+    phase2_need = phase2_target_solves * solve_ref * 1.35
+
+    p1_min = max(1.2 * solve_ref, 5.0)
+    p2_min = max(1.35 * solve_ref, 5.0)
+    cap = max(0.0, float(repair_global_cap_s))
+    need1 = 0.7 * phase1_need + 0.3 * float(phase1_base)
+    need2 = 0.7 * phase2_need + 0.3 * float(phase2_base)
+
+    if cap <= 0.0:
+        phase1_budget = 0.0
+        phase2_budget = 0.0
+    elif cap < (p1_min + p2_min):
+        phase1_budget = cap * 0.5
+        phase2_budget = cap - phase1_budget
+    else:
+        residual = cap - p1_min - p2_min
+        need_sum = need1 + need2
+        if need_sum > 0:
+            phase1_budget = p1_min + residual * (need1 / need_sum)
+        else:
+            phase1_budget = p1_min + residual * 0.5
+        phase2_budget = cap - phase1_budget
+    phase1_budget = max(0.0, phase1_budget)
+    phase2_budget = max(0.0, phase2_budget)
+
+    return {
+        "allocator_version": "v2_nonstarve",
+        "phase1_target_solves": float(phase1_target_solves),
+        "phase2_target_solves": float(phase2_target_solves),
+        "phase1_need_s": float(phase1_need),
+        "phase2_need_s": float(phase2_need),
+        "need1": float(need1),
+        "need2": float(need2),
+        "phase1_budget_s": float(phase1_budget),
+        "phase2_budget_s": float(phase2_budget),
+        "p1_min_s": float(p1_min),
+        "p2_min_s": float(p2_min),
+        "phase1_starved": bool(cap > 0.0 and phase1_budget <= 0.0),
+        "global_cap_s": float(cap),
+    }
 
 
 def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -> PipelineMetrics:
@@ -28,6 +118,8 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
     t_total = time.time()
     slug = config.label.lower().replace(" ", "_").replace("-", "x")
     paths = runtime.paths
+    solve_fn, solve_stats, deterministic_enabled = _make_solve_fn(runtime)
+    Path(paths.out_dir).mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'=' * 68}")
     print(f"  {config.label}  [{W}x{H} = {W*H:,} cells]")
@@ -124,37 +216,85 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
     print(f"  {time.time()-t0:.1f}s  density={grid.mean():.3f}")
     assert_board_valid(grid, forbidden, f"{config.label} post-SA")
 
-    sr_pre = solve_board(grid)
+    t_solve0 = time.perf_counter()
+    sr_pre = solve_fn(grid)
+    solve_s0 = max(0.001, time.perf_counter() - t_solve0)
+
     n_unk_pre = sr_pre.n_unknown
-    budget1 = config.repair1_budget_s if config.repair1_budget_s is not None else max(60.0, n_unk_pre * 0.15 + 30)
-    print(f"\n  [Phase 1 Repair]  budget={budget1:.0f}s  (n_unk={n_unk_pre})")
-
-    phase1 = run_phase1_repair(
-        RepairContext(
-            grid=grid,
-            target=target,
-            weights=weights,
-            forbidden=forbidden,
-            label=slug,
-            time_budget_s=budget1,
-            deadline_s=time.perf_counter() + float(budget1),
-            solve_fn=_solve_fn,
-            output_dir=str(paths.out_dir),
-            verbose=runtime.verbose,
-            max_rounds=300,
-            batch_size=10,
-            search_radius=6,
-            checkpoint_every=10,
-        )
+    phase1_base = config.repair1_budget_s if config.repair1_budget_s is not None else max(60.0, n_unk_pre * 0.15 + 30.0)
+    phase2_base = float(config.repair2_budget_s)
+    repair_global_cap_s = (
+        float(runtime.repair_global_cap_s)
+        if runtime.repair_global_cap_s is not None
+        else float(phase1_base + phase2_base)
     )
-    grid = phase1.grid
-    sr = phase1.solve_result
-    reason1 = phase1.reason
-    assert_board_valid(grid, forbidden, f"{config.label} post-repair1")
-    analyze_unknowns(grid, sr, target, f"{config.label} after Phase 1")
 
-    if sr.n_unknown > 0:
-        print(f"\n  [Phase 2 Swap Repair]  budget={config.repair2_budget_s:.0f}s")
+    budget_plan = _compute_adaptive_repair_budgets(
+        n_unknown_pre=n_unk_pre,
+        solve_s0=solve_s0,
+        phase1_base=phase1_base,
+        phase2_base=phase2_base,
+        repair_global_cap_s=repair_global_cap_s,
+    )
+
+    global_repair_start = time.perf_counter()
+    global_repair_deadline = global_repair_start + repair_global_cap_s
+    phase1_elapsed_s = 0.0
+    phase2_elapsed_s = 0.0
+    phase1_telemetry: dict[str, float | int] = {}
+    phase2_telemetry: dict[str, float | int] = {}
+
+    print(
+        "\n  [Repair budget] "
+        f"global_cap={repair_global_cap_s:.0f}s "
+        f"solve_s0={solve_s0:.3f}s "
+        f"p1_alloc={budget_plan['phase1_budget_s']:.0f}s "
+        f"p2_plan={budget_plan['phase2_budget_s']:.0f}s"
+    )
+
+    p1_remaining_global = max(0.0, global_repair_deadline - time.perf_counter())
+    phase1_budget = min(budget_plan["phase1_budget_s"], p1_remaining_global)
+
+    sr = sr_pre
+    reason1 = "skipped_budget_exhausted"
+    if phase1_budget > 0.0:
+        print(f"\n  [Phase 1 Repair]  budget={phase1_budget:.0f}s  (n_unk={n_unk_pre})")
+        phase1_deadline = min(global_repair_deadline, time.perf_counter() + float(phase1_budget))
+        phase1 = run_phase1_repair(
+            RepairContext(
+                grid=grid,
+                target=target,
+                weights=weights,
+                forbidden=forbidden,
+                label=slug,
+                time_budget_s=phase1_budget,
+                deadline_s=phase1_deadline,
+                solve_fn=solve_fn,
+                output_dir=str(paths.out_dir),
+                verbose=runtime.verbose,
+                max_rounds=300,
+                batch_size=10,
+                search_radius=6,
+                checkpoint_every=10,
+                initial_solve_result=sr_pre,
+                frontier_radius=3,
+                enable_low_yield_handoff=True,
+                handoff_min_solves=6,
+                handoff_window=4,
+                handoff_min_rate=0.75,
+            )
+        )
+        grid = phase1.grid
+        sr = phase1.solve_result
+        reason1 = phase1.reason
+        phase1_telemetry = dict(phase1.telemetry)
+        phase1_elapsed_s = float(phase1_telemetry.get("elapsed_s", max(0.0, time.perf_counter() - global_repair_start)))
+        assert_board_valid(grid, forbidden, f"{config.label} post-repair1")
+        analyze_unknowns(grid, sr, target, f"{config.label} after Phase 1")
+
+    p2_remaining_global = max(0.0, global_repair_deadline - time.perf_counter())
+    if sr.n_unknown > 0 and p2_remaining_global > 0.0:
+        print(f"\n  [Phase 2 Swap Repair]  budget={p2_remaining_global:.0f}s")
         phase2 = run_phase2_swap_repair(
             RepairContext(
                 grid=grid,
@@ -162,20 +302,25 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
                 weights=weights,
                 forbidden=forbidden,
                 label=slug,
-                time_budget_s=config.repair2_budget_s,
-                deadline_s=time.perf_counter() + float(config.repair2_budget_s),
-                solve_fn=_solve_fn,
+                time_budget_s=p2_remaining_global,
+                deadline_s=global_repair_deadline,
+                solve_fn=solve_fn,
                 output_dir=str(paths.out_dir),
                 verbose=runtime.verbose,
                 max_outer=300,
                 initial_solve_result=sr,
+                frontier_radius=3,
             )
         )
         grid = phase2.grid
         sr = phase2.solve_result
         reason2 = phase2.reason
+        phase2_telemetry = dict(phase2.telemetry)
+        phase2_elapsed_s = float(phase2_telemetry.get("elapsed_s", max(0.0, time.perf_counter() - global_repair_start - phase1_elapsed_s)))
         assert_board_valid(grid, forbidden, f"{config.label} post-repair2")
         analyze_unknowns(grid, sr, target, f"{config.label} after Phase 2")
+    elif sr.n_unknown > 0:
+        reason2 = "skipped_budget_exhausted"
     else:
         reason2 = "skipped_already_solved"
 
@@ -190,7 +335,7 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
                 label=slug,
                 time_budget_s=0.0,
                 deadline_s=None,
-                solve_fn=_solve_fn,
+                solve_fn=solve_fn,
                 output_dir=str(paths.out_dir),
                 verbose=runtime.verbose,
                 max_unknown=config.repair3_max_unknown,
@@ -207,6 +352,12 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
 
     N_fin = compute_N(grid)
     err = np.abs(N_fin - target)
+
+    repro_fingerprint = build_repro_fingerprint(
+        solver_mode=runtime.solver_mode,
+        strict_repro=runtime.strict_repro,
+        deterministic_order=runtime.deterministic_order,
+    )
 
     metrics = PipelineMetrics(
         label=config.label,
@@ -226,6 +377,31 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
         repair2_reason=reason2,
         repair3_reason=reason3,
         total_time_s=round(time.time() - t_total, 1),
+        solver_mode=runtime.solver_mode,
+        repair_global_cap_s=round(repair_global_cap_s, 3),
+        repair_phase1_elapsed_s=round(phase1_elapsed_s, 3),
+        repair_phase2_elapsed_s=round(phase2_elapsed_s, 3),
+        phase1_prefilter_total=int(phase1_telemetry.get("prefilter_total", 0)),
+        phase1_prefilter_passed=int(phase1_telemetry.get("prefilter_passed", 0)),
+        phase1_prefilter_rejected=int(phase1_telemetry.get("prefilter_rejected", 0)),
+        phase1_full_evals=int(phase1_telemetry.get("full_evals", 0)),
+        phase1_full_eval_time_s=round(float(phase1_telemetry.get("full_eval_time_s", 0.0)), 4),
+        phase2_prefilter_total=int(phase2_telemetry.get("prefilter_total", 0)),
+        phase2_prefilter_passed=int(phase2_telemetry.get("prefilter_passed", 0)),
+        phase2_prefilter_rejected=int(phase2_telemetry.get("prefilter_rejected", 0)),
+        phase2_full_evals=int(phase2_telemetry.get("full_evals", 0)),
+        phase2_full_eval_time_s=round(float(phase2_telemetry.get("full_eval_time_s", 0.0)), 4),
+        allocator_version=str(budget_plan.get("allocator_version", "")),
+        phase1_alloc_s=round(float(budget_plan.get("phase1_budget_s", 0.0)), 3),
+        phase2_alloc_s=round(float(budget_plan.get("phase2_budget_s", 0.0)), 3),
+        phase1_starved=bool(budget_plan.get("phase1_starved", False)),
+        deterministic_order="on" if deterministic_enabled else "off",
+        deterministic_sort_calls_total=int(solve_stats.get("sort_calls", 0)),
+        deterministic_sort_items_total=int(solve_stats.get("sort_items", 0)),
+        deterministic_sort_time_s_total=round(float(solve_stats.get("sort_time_s", 0.0)), 6),
+        repair_phase1_telemetry=phase1_telemetry,
+        repair_phase2_telemetry=phase2_telemetry,
+        repro_fingerprint=repro_fingerprint,
     )
 
     print(f"\n  METRICS [{config.label}]:")
@@ -287,9 +463,17 @@ def run_experiment(config: RunConfig) -> list[PipelineMetrics]:
         "coverage",
         "solvable",
         "n_unknown",
+        "solver_mode",
+        "deterministic_order",
+        "repair_global_cap_s",
+        "phase1_alloc_s",
+        "phase2_alloc_s",
+        "phase1_starved",
         "repair1_reason",
         "repair2_reason",
         "repair3_reason",
+        "repair_phase1_elapsed_s",
+        "repair_phase2_elapsed_s",
         "total_time_s",
     ]
     labels = [m.label for m in all_metrics]

@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import heapq
 
+import numpy as np
+
 from .core import compute_N
-from .models import RepairContext, RepairResult
+from .models import RepairContext, RepairResult, SolveResult
+from .repair_prefilter import forcing_potential_score
 from .runtime import BudgetExceeded, check_deadline, now_s
+
+
+def _candidate_key(edits: list[tuple[int, int, int]] | tuple[tuple[int, int, int], ...]) -> tuple[tuple[int, int, int], ...]:
+    return tuple(sorted((int(y), int(x), int(delta)) for y, x, delta in edits))
 
 
 def _check_swap_valid(N_cur, H, W, my, mx, ty, tx):
@@ -40,6 +47,27 @@ def _swap_asymmetry_score(my, mx, ty, tx, unknown_set, H, W):
     return exclusive - shared * 0.5
 
 
+def _target_pass_rate_from_pressure(pressure: float) -> float:
+    if pressure < 0.35:
+        return 0.25
+    if pressure <= 0.70:
+        return 0.35
+    return 0.45
+
+
+def _quantile_threshold(scores: list[float], pass_rate: float) -> float:
+    if not scores:
+        return float("inf")
+    q = max(0.0, min(1.0, 1.0 - pass_rate))
+    return float(np.quantile(np.array(scores, dtype=np.float32), q))
+
+
+def _pct(part: float, total: float) -> float:
+    if total <= 0:
+        return 0.0
+    return round(100.0 * part / total, 2)
+
+
 def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
     H, W = context.grid.shape
     t_start = now_s()
@@ -47,22 +75,39 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
 
     best = context.grid.copy()
     best_sr = context.initial_solve_result
-    if best_sr is None:
-        best_sr = context.solve_fn(best, deadline_s)
-
-    best_unk = best_sr.n_unknown
-    best_cov = best_sr.coverage
-
     solve_calls = 0
     solve_time_s = 0.0
     no_improve_outer = 0
+    prefilter_total = 0
+    prefilter_passed = 0
+    prefilter_rejected = 0
+    full_evals = 0
+    full_eval_time_s = 0.0
+    cache_hits = 0
+    cache_misses = 0
+    duplicate_eval_skipped = 0
+    forcing_checks = 0
+    forcing_passes = 0
+    adaptive_threshold_sum = 0.0
+    target_pass_rate_sum = 0.0
+    effective_pass_rate_sum = 0.0
+    adaptive_rounds = 0
+    mine_scan_s = 0.0
+    target_scan_s = 0.0
+    swap_scoring_s = 0.0
+    prefilter_s = 0.0
 
     max_outer = context.max_outer or 200
-    max_mines = 24
-    max_targets = 180
-    max_scored_swaps = 320
-    max_swap_eval = 20
-    max_remove_eval = 12
+    max_mines = 16
+    max_targets = 96
+    max_scored_swaps = 160
+    max_swap_eval = 12
+    max_remove_eval = 8
+    scan_unknown_cap = 256
+    solve_cache: dict[tuple[tuple[int, int, int], ...], SolveResult] = {}
+
+    def deadline_reached() -> bool:
+        return deadline_s is not None and now_s() >= deadline_s
 
     def solve_with_budget(board):
         nonlocal solve_calls, solve_time_s
@@ -72,6 +117,58 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
         solve_calls += 1
         solve_time_s += now_s() - ts
         return sr_local
+
+    def evaluate_edits(edits: list[tuple[int, int, int]]) -> SolveResult:
+        nonlocal cache_hits, cache_misses, full_evals, full_eval_time_s
+        key = _candidate_key(edits)
+        cached = solve_cache.get(key)
+        if cached is not None:
+            cache_hits += 1
+            return cached
+        cache_misses += 1
+        candidate = best.copy()
+        for y, x, delta in edits:
+            candidate[y, x] = 1 if delta > 0 else 0
+        t_eval = now_s()
+        sr_local = solve_with_budget(candidate)
+        dt = now_s() - t_eval
+        full_eval_time_s += dt
+        full_evals += 1
+        solve_cache[key] = sr_local
+        return sr_local
+
+    try:
+        if best_sr is None:
+            best_sr = solve_with_budget(best)
+    except BudgetExceeded:
+        fallback_unknown = set(map(tuple, np.argwhere(best == 0)))
+        fallback_sr = SolveResult(
+            solvable=False,
+            revealed=set(),
+            flagged=set(),
+            unknown=fallback_unknown,
+            coverage=0.0,
+            mine_accuracy=0.0,
+            n_unknown=len(fallback_unknown),
+        )
+        return RepairResult(
+            grid=best,
+            solve_result=fallback_sr,
+            reason=f"timeout ({now_s()-t_start:.0f}s)",
+            telemetry={
+                "solve_calls": solve_calls,
+                "solve_time_s": round(solve_time_s, 4),
+                "elapsed_s": round(now_s() - t_start, 3),
+                "prefilter_total": prefilter_total,
+                "prefilter_passed": prefilter_passed,
+                "prefilter_rejected": prefilter_rejected,
+                "full_evals": full_evals,
+                "full_eval_time_s": round(full_eval_time_s, 4),
+            },
+        )
+
+    best_unk = best_sr.n_unknown
+    best_cov = best_sr.coverage
 
     if best_unk == 0:
         return RepairResult(
@@ -97,11 +194,17 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
             break
 
         unknown_set = best_sr.unknown
-        unknown_list = list(unknown_set)
+        unknown_list = sorted(unknown_set)
+        if len(unknown_list) > scan_unknown_cap:
+            stride = max(1, len(unknown_list) // scan_unknown_cap)
+            scan_unknown = unknown_list[::stride][:scan_unknown_cap]
+        else:
+            scan_unknown = unknown_list
 
+        t_stage = now_s()
         mine_scores = {}
-        for u_i, (uy, ux) in enumerate(unknown_list):
-            if u_i % 32 == 0 and now_s() >= deadline_s:
+        for u_i, (uy, ux) in enumerate(scan_unknown):
+            if u_i % 32 == 0 and deadline_reached():
                 stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                 break
             for r in range(1, 6):
@@ -112,6 +215,7 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
                         ny, nx = uy + dy, ux + dx
                         if 0 <= ny < H and 0 <= nx < W and best[ny, nx] == 1 and context.forbidden[ny, nx] == 0:
                             mine_scores[(ny, nx)] = mine_scores.get((ny, nx), 0) + 1
+        mine_scan_s += now_s() - t_stage
         if stop_reason.startswith("timeout"):
             break
 
@@ -121,9 +225,10 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
 
         sorted_mines = sorted(mine_scores.items(), key=lambda x: -x[1])
 
+        t_stage = now_s()
         target_set = {}
-        for u_i, (uy, ux) in enumerate(unknown_list):
-            if u_i % 32 == 0 and now_s() >= deadline_s:
+        for u_i, (uy, ux) in enumerate(scan_unknown):
+            if u_i % 32 == 0 and deadline_reached():
                 stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                 break
             for dy in range(-3, 4):
@@ -133,6 +238,7 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
                         if (ty, tx) not in target_set:
                             target_set[(ty, tx)] = []
                         target_set[(ty, tx)].append((uy, ux))
+        target_scan_s += now_s() - t_stage
         if stop_reason.startswith("timeout"):
             break
 
@@ -141,13 +247,14 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
             stop_reason = "no_swap_targets"
             break
 
+        t_stage = now_s()
         scored_heap = []
         for mi, ((my, mx), _) in enumerate(sorted_mines[:max_mines]):
-            if mi % 4 == 0 and now_s() >= deadline_s:
+            if mi % 4 == 0 and deadline_reached():
                 stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                 break
             for t_i, ((ty, tx), supporters) in enumerate(ranked_targets):
-                if t_i % 32 == 0 and now_s() >= deadline_s:
+                if t_i % 32 == 0 and deadline_reached():
                     stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                     break
                 if (ty, tx) == (my, mx):
@@ -162,6 +269,7 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
                     heapq.heapreplace(scored_heap, item)
             if stop_reason.startswith("timeout"):
                 break
+        swap_scoring_s += now_s() - t_stage
         if stop_reason.startswith("timeout"):
             break
 
@@ -172,28 +280,91 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
 
         improved = False
         avg_solve_s = solve_time_s / max(solve_calls, 1)
-        remaining_s = max(0.0, deadline_s - now_s())
+        remaining_s = max(0.0, deadline_s - now_s()) if deadline_s is not None else 10.0
         affordable_solves = max(1, int(remaining_s / max(avg_solve_s, 0.05)))
         swap_eval_cap = min(max_swap_eval, max(1, affordable_solves - 2))
         remove_eval_cap = min(max_remove_eval, max(1, affordable_solves - swap_eval_cap - 1))
 
-        for score, my, mx, ty, tx in scored_swaps[:swap_eval_cap]:
-            if now_s() >= deadline_s:
+        t_stage = now_s()
+        fallback_swaps = {(my, mx, ty, tx) for _, my, mx, ty, tx in scored_swaps[:3]}
+        prefilter_scan_cap = min(len(scored_swaps), max(24, swap_eval_cap * 6))
+        scored_subset = scored_swaps[:prefilter_scan_cap]
+        pressure = remaining_s / max(context.time_budget_s, 1e-9)
+        target_pass_rate = _target_pass_rate_from_pressure(pressure)
+        adaptive_threshold = _quantile_threshold([float(s) for s, *_ in scored_subset], target_pass_rate)
+        adaptive_threshold_sum += adaptive_threshold if np.isfinite(adaptive_threshold) else 0.0
+        target_pass_rate_sum += target_pass_rate
+        adaptive_rounds += 1
+
+        gated_swaps: list[tuple[float, int, int, int, int]] = []
+        gated_keys: set[tuple[int, int, int, int]] = set()
+        for score, my, mx, ty, tx in scored_subset:
+            pass_gate = (my, mx, ty, tx) in fallback_swaps or score >= adaptive_threshold
+            if not pass_gate:
+                forcing_checks += 1
+                forcing_score = forcing_potential_score(
+                    N_cur=N_cur,
+                    edits=[(my, mx, -1), (ty, tx, 1)],
+                    revealed=best_sr.revealed,
+                    flagged=best_sr.flagged,
+                    H=H,
+                    W=W,
+                    frontier_radius=context.frontier_radius,
+                )
+                if forcing_score >= 2:
+                    forcing_passes += 1
+                    pass_gate = True
+            if pass_gate:
+                key4 = (my, mx, ty, tx)
+                if key4 not in gated_keys:
+                    gated_keys.add(key4)
+                    gated_swaps.append((score, my, mx, ty, tx))
+
+        min_pass = max(3, swap_eval_cap)
+        max_pass = max(8, swap_eval_cap * 3)
+        if len(gated_swaps) < min_pass:
+            for score, my, mx, ty, tx in scored_subset:
+                key4 = (my, mx, ty, tx)
+                if key4 not in gated_keys:
+                    gated_keys.add(key4)
+                    gated_swaps.append((score, my, mx, ty, tx))
+                if len(gated_swaps) >= min_pass:
+                    break
+        if len(gated_swaps) > max_pass:
+            gated_swaps = gated_swaps[:max_pass]
+
+        considered = len(scored_subset)
+        passed = len(gated_swaps)
+        prefilter_total += considered
+        prefilter_passed += passed
+        prefilter_rejected += max(0, considered - passed)
+        effective_pass_rate_sum += (float(passed) / max(1, considered))
+        prefilter_s += now_s() - t_stage
+
+        eval_seen: set[tuple[tuple[int, int, int], ...]] = set()
+
+        for score, my, mx, ty, tx in gated_swaps[:swap_eval_cap]:
+            if deadline_reached():
                 stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                 break
-            candidate = best.copy()
-            candidate[my, mx] = 0
-            candidate[ty, tx] = 1
             if context.forbidden[ty, tx] == 1:
                 continue
+            edits = [(my, mx, -1), (ty, tx, 1)]
+            key = _candidate_key(edits)
+            if key in eval_seen:
+                duplicate_eval_skipped += 1
+                continue
+            eval_seen.add(key)
             try:
-                new_sr = solve_with_budget(candidate)
+                new_sr = evaluate_edits(edits)
             except BudgetExceeded:
                 stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                 break
 
             if new_sr.n_unknown < best_unk or (new_sr.n_unknown == best_unk and new_sr.coverage > best_cov + 0.001):
-                best = candidate
+                best[my, mx] = 0
+                best[ty, tx] = 1
+                solve_cache.clear()
                 best_sr = new_sr
                 best_unk = new_sr.n_unknown
                 best_cov = new_sr.coverage
@@ -212,21 +383,23 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
 
         if not improved:
             for (my, mx), _ in sorted_mines[:remove_eval_cap]:
-                if now_s() >= deadline_s:
+                if deadline_reached():
                     stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                     break
-                candidate = best.copy()
-                candidate[my, mx] = 0
-                N_c = compute_N(candidate)
-                if N_c.min() < 0:
+                edits = [(my, mx, -1)]
+                key = _candidate_key(edits)
+                if key in eval_seen:
+                    duplicate_eval_skipped += 1
                     continue
+                eval_seen.add(key)
                 try:
-                    new_sr = solve_with_budget(candidate)
+                    new_sr = evaluate_edits(edits)
                 except BudgetExceeded:
                     stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                     break
                 if new_sr.n_unknown < best_unk or new_sr.coverage > best_cov + 0.001:
-                    best = candidate
+                    best[my, mx] = 0
+                    solve_cache.clear()
                     best_sr = new_sr
                     best_unk = new_sr.n_unknown
                     best_cov = new_sr.coverage
@@ -260,5 +433,31 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
         "solve_calls": solve_calls,
         "solve_time_s": round(solve_time_s, 4),
         "elapsed_s": round(elapsed, 3),
+        "prefilter_total": prefilter_total,
+        "prefilter_passed": prefilter_passed,
+        "prefilter_rejected": prefilter_rejected,
+        "full_evals": full_evals,
+        "full_eval_time_s": round(full_eval_time_s, 4),
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "duplicate_eval_skipped": duplicate_eval_skipped,
+        "adaptive_threshold": round(adaptive_threshold_sum / max(1, adaptive_rounds), 4),
+        "target_pass_rate": round(target_pass_rate_sum / max(1, adaptive_rounds), 4),
+        "effective_pass_rate": round(effective_pass_rate_sum / max(1, adaptive_rounds), 4),
+        "forcing_checks": forcing_checks,
+        "forcing_passes": forcing_passes,
+        "mine_scan_s": round(mine_scan_s, 4),
+        "target_scan_s": round(target_scan_s, 4),
+        "swap_scoring_s": round(swap_scoring_s, 4),
+        "prefilter_s": round(prefilter_s, 4),
+        "full_eval_s": round(full_eval_time_s, 4),
+        "solve_wait_s": round(solve_time_s, 4),
+        "total_s": round(elapsed, 4),
+        "mine_scan_pct": _pct(mine_scan_s, elapsed),
+        "target_scan_pct": _pct(target_scan_s, elapsed),
+        "swap_scoring_pct": _pct(swap_scoring_s, elapsed),
+        "prefilter_pct": _pct(prefilter_s, elapsed),
+        "full_eval_pct": _pct(full_eval_time_s, elapsed),
+        "solve_wait_pct": _pct(solve_time_s, elapsed),
     }
     return RepairResult(grid=best, solve_result=best_sr, reason=stop_reason, telemetry=telemetry)

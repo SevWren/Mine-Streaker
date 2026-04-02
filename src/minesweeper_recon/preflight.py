@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from .config import PathsConfig
@@ -21,6 +23,18 @@ REQUIRED_MODULES = [
     ("matplotlib", "matplotlib"),
 ]
 
+STRICT_REPRO_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMBA_NUM_THREADS",
+)
+STRICT_REEXEC_MARKER = "MSR_STRICT_REEXEC"
+
+
+def _ps_quote(token: str) -> str:
+    return "'" + token.replace("'", "''") + "'"
+
 
 def parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -36,6 +50,32 @@ def parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
         default=str(defaults.out_dir),
         help="Directory for output artifacts (default: results/iter10_win10).",
     )
+    parser.add_argument(
+        "--solver-mode",
+        choices=("legacy", "fast"),
+        default="fast",
+        help="Solver implementation for A/B comparison (default: fast).",
+    )
+    parser.add_argument(
+        "--deterministic-order",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Deterministic ordering policy for solver internals (default: auto).",
+    )
+    strict_group = parser.add_mutually_exclusive_group()
+    strict_group.add_argument(
+        "--strict-repro",
+        dest="strict_repro",
+        action="store_true",
+        help="Require strict same-machine reproducibility checks (default).",
+    )
+    strict_group.add_argument(
+        "--no-strict-repro",
+        dest="strict_repro",
+        action="store_false",
+        help="Disable strict reproducibility enforcement.",
+    )
+    parser.set_defaults(strict_repro=True)
     return parser.parse_args(argv)
 
 
@@ -44,6 +84,66 @@ def resolve_paths(args: argparse.Namespace, defaults: PathsConfig) -> PathsConfi
     img = Path(args.img).expanduser().resolve()
     out_dir = Path(args.out).expanduser().resolve()
     return PathsConfig(repo_root=repo_root, img=img, out_dir=out_dir)
+
+
+def maybe_reexec_with_strict_repro(
+    strict_repro: bool,
+    script_path: Path,
+    argv: list[str] | None = None,
+    python_executable: Path | None = None,
+) -> int | None:
+    """
+    If strict reproducibility is requested but PYTHONHASHSEED is not 0, relaunch
+    the same command with PYTHONHASHSEED=0 and return the child exit code.
+    Returns None when no relaunch was needed (or relaunch failed to start).
+    """
+    if not strict_repro:
+        return None
+    if os.environ.get("PYTHONHASHSEED") == "0":
+        return None
+    if os.environ.get(STRICT_REEXEC_MARKER) == "1":
+        return None
+
+    exe = str((python_executable or Path(sys.executable)).resolve())
+    args = argv or []
+    env = os.environ.copy()
+    env["PYTHONHASHSEED"] = "0"
+    env[STRICT_REEXEC_MARKER] = "1"
+
+    cmd = [exe, str(script_path), *args]
+    print("INFO: strict reproducibility enabled; relaunching with PYTHONHASHSEED=0")
+    try:
+        return subprocess.call(cmd, env=env)
+    except OSError:
+        return None
+
+
+def enforce_strict_repro_or_raise(
+    strict_repro: bool,
+    script_path: Path,
+    argv: list[str] | None = None,
+    python_executable: Path | None = None,
+) -> None:
+    if not strict_repro:
+        return
+
+    pyhash = os.environ.get("PYTHONHASHSEED")
+    if pyhash != "0":
+        args = argv or []
+        exe = str((python_executable or Path(sys.executable)).resolve())
+        cmdline = subprocess.list2cmdline([exe, str(script_path), *args])
+        # Build PowerShell-safe command with explicit executable + args.
+        ps_tokens = [exe, str(script_path), *args]
+        ps_cmd = "$env:PYTHONHASHSEED='0'; & " + " ".join(_ps_quote(token) for token in ps_tokens)
+        raise ConfigError(
+            "Strict reproducibility requires PYTHONHASHSEED=0.\n"
+            "Rerun commands:\n"
+            f"  PowerShell: {ps_cmd}\n"
+            f"  cmd.exe: set PYTHONHASHSEED=0 && {cmdline}"
+        )
+
+    for env_key in STRICT_REPRO_ENV_VARS:
+        os.environ[env_key] = "1"
 
 
 def validate_image_path(path: Path) -> None:
