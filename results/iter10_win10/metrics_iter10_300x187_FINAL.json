@@ -1,0 +1,19 @@
+{
+  "label": "300x187",
+  "board": "300x187",
+  "cells": 56100,
+  "loss_per_cell": 1.514,
+  "mean_abs_error": 0.6869,
+  "pct_within_1": 76.11,
+  "pct_within_2": 90.48,
+  "mine_density": 0.1322,
+  "corridor_pct": 10.4,
+  "coverage": 0.9852,
+  "solvable": false,
+  "mine_accuracy": 0.8993,
+  "n_unknown": 722,
+  "repair1_reason": "timeout (151s)",
+  "repair2_reason": "timeout (180s)",
+  "repair3_reason": "skipped (n_unk=722)",
+  "total_time_s": 368.0
+}
