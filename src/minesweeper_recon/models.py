@@ -112,6 +112,11 @@ class PipelineMetrics:
     deterministic_sort_time_s_total: float = 0.0
     repair_phase1_telemetry: dict[str, Any] = field(default_factory=dict)
     repair_phase2_telemetry: dict[str, Any] = field(default_factory=dict)
+    parallel_jobs: int = 1
+    parallel_enabled: bool = False
+    parallel_tasks_submitted: int = 0
+    parallel_tasks_completed: int = 0
+    parallel_tasks_cancelled: int = 0
     repro_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -157,5 +162,62 @@ class PipelineMetrics:
             "deterministic_sort_time_s_total": self.deterministic_sort_time_s_total,
             "repair_phase1_telemetry": self.repair_phase1_telemetry,
             "repair_phase2_telemetry": self.repair_phase2_telemetry,
+            "parallel_jobs": self.parallel_jobs,
+            "parallel_enabled": self.parallel_enabled,
+            "parallel_tasks_submitted": self.parallel_tasks_submitted,
+            "parallel_tasks_completed": self.parallel_tasks_completed,
+            "parallel_tasks_cancelled": self.parallel_tasks_cancelled,
             "repro_fingerprint": self.repro_fingerprint,
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "PipelineMetrics":
+        return cls(
+            label=str(payload["label"]),
+            board=str(payload["board"]),
+            cells=int(payload["cells"]),
+            loss_per_cell=float(payload["loss_per_cell"]),
+            mean_abs_error=float(payload["mean_abs_error"]),
+            pct_within_1=float(payload["pct_within_1"]),
+            pct_within_2=float(payload["pct_within_2"]),
+            mine_density=float(payload["mine_density"]),
+            corridor_pct=float(payload["corridor_pct"]),
+            coverage=float(payload["coverage"]),
+            solvable=bool(payload["solvable"]),
+            mine_accuracy=float(payload["mine_accuracy"]),
+            n_unknown=int(payload["n_unknown"]),
+            repair1_reason=str(payload["repair1_reason"]),
+            repair2_reason=str(payload["repair2_reason"]),
+            repair3_reason=str(payload["repair3_reason"]),
+            total_time_s=float(payload["total_time_s"]),
+            solver_mode=str(payload.get("solver_mode", "fast")),
+            repair_global_cap_s=float(payload.get("repair_global_cap_s", 0.0)),
+            repair_phase1_elapsed_s=float(payload.get("repair_phase1_elapsed_s", 0.0)),
+            repair_phase2_elapsed_s=float(payload.get("repair_phase2_elapsed_s", 0.0)),
+            phase1_prefilter_total=int(payload.get("phase1_prefilter_total", 0)),
+            phase1_prefilter_passed=int(payload.get("phase1_prefilter_passed", 0)),
+            phase1_prefilter_rejected=int(payload.get("phase1_prefilter_rejected", 0)),
+            phase1_full_evals=int(payload.get("phase1_full_evals", 0)),
+            phase1_full_eval_time_s=float(payload.get("phase1_full_eval_time_s", 0.0)),
+            phase2_prefilter_total=int(payload.get("phase2_prefilter_total", 0)),
+            phase2_prefilter_passed=int(payload.get("phase2_prefilter_passed", 0)),
+            phase2_prefilter_rejected=int(payload.get("phase2_prefilter_rejected", 0)),
+            phase2_full_evals=int(payload.get("phase2_full_evals", 0)),
+            phase2_full_eval_time_s=float(payload.get("phase2_full_eval_time_s", 0.0)),
+            allocator_version=str(payload.get("allocator_version", "")),
+            phase1_alloc_s=float(payload.get("phase1_alloc_s", 0.0)),
+            phase2_alloc_s=float(payload.get("phase2_alloc_s", 0.0)),
+            phase1_starved=bool(payload.get("phase1_starved", False)),
+            deterministic_order=str(payload.get("deterministic_order", "auto")),
+            deterministic_sort_calls_total=int(payload.get("deterministic_sort_calls_total", 0)),
+            deterministic_sort_items_total=int(payload.get("deterministic_sort_items_total", 0)),
+            deterministic_sort_time_s_total=float(payload.get("deterministic_sort_time_s_total", 0.0)),
+            repair_phase1_telemetry=dict(payload.get("repair_phase1_telemetry", {})),
+            repair_phase2_telemetry=dict(payload.get("repair_phase2_telemetry", {})),
+            parallel_jobs=int(payload.get("parallel_jobs", 1)),
+            parallel_enabled=bool(payload.get("parallel_enabled", False)),
+            parallel_tasks_submitted=int(payload.get("parallel_tasks_submitted", 0)),
+            parallel_tasks_completed=int(payload.get("parallel_tasks_completed", 0)),
+            parallel_tasks_cancelled=int(payload.get("parallel_tasks_cancelled", 0)),
+            repro_fingerprint=str(payload.get("repro_fingerprint", "")),
+        )

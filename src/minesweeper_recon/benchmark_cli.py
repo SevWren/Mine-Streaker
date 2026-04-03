@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import multiprocessing as mp
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from .benchmark import build_standard_matrix, evaluate_acceptance_gates, run_benchmark_matrix, summarize_by_board
 from .config import PathsConfig, RunConfig, RuntimeConfig
+from .models import PipelineMetrics
 from .preflight import (
     check_required_modules_or_raise,
     configure_mplconfigdir,
@@ -18,6 +21,8 @@ from .preflight import (
     validate_image_path,
 )
 from .runtime import ConfigError, DependencyError, OutputError
+
+_BENCHMARK_WORKER_SA_FN = None
 
 
 def _parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
@@ -43,8 +48,33 @@ def _parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
     strict_group.add_argument("--no-strict-repro", dest="strict_repro", action="store_false", help="Disable strict reproducibility checks.")
     parser.set_defaults(strict_repro=True)
     parser.add_argument("--repair-global-cap-s", type=float, default=None, help="Optional global repair cap override in seconds.")
+    parser.add_argument("--jobs", type=int, default=1, help="Parallel worker processes for benchmark tasks (default: 1).")
+    parser.add_argument(
+        "--failure-policy",
+        choices=("fail_fast", "continue"),
+        default="fail_fast",
+        help="Worker failure behavior in parallel mode (default: fail_fast).",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose pipeline output.")
     return parser.parse_args(argv)
+
+
+def _benchmark_worker_init() -> None:
+    global _BENCHMARK_WORKER_SA_FN
+    from .sa import compile_sa_kernel
+
+    _BENCHMARK_WORKER_SA_FN = compile_sa_kernel()
+
+
+def _benchmark_worker_run(task_index: int, mode: str, board, runtime: RuntimeConfig) -> tuple[int, str, dict]:
+    global _BENCHMARK_WORKER_SA_FN
+    from .pipeline import _run_board_with_kernel
+    from .sa import compile_sa_kernel
+
+    if _BENCHMARK_WORKER_SA_FN is None:
+        _BENCHMARK_WORKER_SA_FN = compile_sa_kernel()
+    metrics = _run_board_with_kernel(board, runtime, _BENCHMARK_WORKER_SA_FN)
+    return task_index, mode, metrics.to_dict()
 
 
 def _collect_reason_counts(metrics) -> dict[str, dict[str, dict[str, int]]]:
@@ -93,6 +123,8 @@ def main(argv=None) -> int:
     out_root = Path(args.out).expanduser().resolve()
 
     try:
+        if int(args.jobs) < 1:
+            raise ConfigError(f"--jobs must be >= 1 (got {args.jobs})")
         script_path = Path(sys.argv[0]).resolve()
         reexec_code = maybe_reexec_with_strict_repro(
             strict_repro=bool(args.strict_repro),
@@ -118,6 +150,7 @@ def main(argv=None) -> int:
         metrics_by_mode = {}
         summary_by_mode = {}
         reasons_by_mode = {}
+        failed_tasks: list[dict[str, str]] = []
         t_bench_start = time.perf_counter()
 
         print("=" * 68)
@@ -130,30 +163,125 @@ def main(argv=None) -> int:
         print(f"Seeds:       {', '.join(str(s) for s in args.seeds)}")
         print(f"Strict repro: {bool(args.strict_repro)}")
         print(f"Deterministic order: {args.deterministic_order}")
+        print(f"Parallel jobs: {int(args.jobs)}")
+        print(f"Failure policy: {args.failure_policy}")
         if args.repair_global_cap_s is not None:
             print(f"Repair global cap override: {args.repair_global_cap_s}s")
 
-        for mode in args.modes:
-            mode_t0 = time.perf_counter()
-            mode_out = out_root / mode
-            ensure_output_dir(mode_out)
+        jobs = int(args.jobs)
+        if jobs <= 1:
+            for mode in args.modes:
+                mode_t0 = time.perf_counter()
+                mode_out = out_root / mode
+                ensure_output_dir(mode_out)
+                print("\n" + "-" * 68)
+                print(f"[Mode: {mode}] start  out={mode_out}")
+                print("-" * 68)
+                runtime = RuntimeConfig(
+                    paths=PathsConfig(repo_root=defaults.repo_root, img=img, out_dir=mode_out),
+                    verbose=bool(args.verbose),
+                    solver_mode=mode,
+                    strict_repro=bool(args.strict_repro),
+                    deterministic_order=args.deterministic_order,
+                    repair_global_cap_s=args.repair_global_cap_s,
+                    benchmark_jobs=jobs,
+                    failure_policy=args.failure_policy,
+                )
+                run_cfg = RunConfig(runtime=runtime, boards=boards)
+                metrics = run_benchmark_matrix(run_cfg, boards=boards)
+                metrics_by_mode[mode] = metrics
+                summary_by_mode[mode] = summarize_by_board(metrics, metric_keys)
+                reasons_by_mode[mode] = _collect_reason_counts(metrics)
+                print(f"[Mode: {mode}] complete in {time.perf_counter() - mode_t0:.1f}s")
+        else:
             print("\n" + "-" * 68)
-            print(f"[Mode: {mode}] start  out={mode_out}")
+            print(f"[Parallel benchmark] launching {jobs} workers across mode/board/seed tasks")
             print("-" * 68)
-            runtime = RuntimeConfig(
-                paths=PathsConfig(repo_root=defaults.repo_root, img=img, out_dir=mode_out),
-                verbose=bool(args.verbose),
-                solver_mode=mode,
-                strict_repro=bool(args.strict_repro),
-                deterministic_order=args.deterministic_order,
-                repair_global_cap_s=args.repair_global_cap_s,
-            )
-            run_cfg = RunConfig(runtime=runtime, boards=boards)
-            metrics = run_benchmark_matrix(run_cfg, boards=boards)
-            metrics_by_mode[mode] = metrics
-            summary_by_mode[mode] = summarize_by_board(metrics, metric_keys)
-            reasons_by_mode[mode] = _collect_reason_counts(metrics)
-            print(f"[Mode: {mode}] complete in {time.perf_counter() - mode_t0:.1f}s")
+
+            task_meta: list[tuple[str, str]] = []
+            task_specs = []
+            seen_keys = set()
+            for mode in args.modes:
+                mode_out = out_root / mode
+                ensure_output_dir(mode_out)
+                runtime = RuntimeConfig(
+                    paths=PathsConfig(repo_root=defaults.repo_root, img=img, out_dir=mode_out),
+                    verbose=bool(args.verbose),
+                    solver_mode=mode,
+                    strict_repro=bool(args.strict_repro),
+                    deterministic_order=args.deterministic_order,
+                    repair_global_cap_s=args.repair_global_cap_s,
+                    benchmark_jobs=jobs,
+                    failure_policy=args.failure_policy,
+                )
+                for board in boards:
+                    key = (mode, board.label)
+                    if key in seen_keys:
+                        raise ConfigError(f"Duplicate benchmark task key detected: mode={mode}, board={board.label}")
+                    seen_keys.add(key)
+                    task_index = len(task_specs)
+                    task_meta.append((mode, board.label))
+                    task_specs.append((task_index, mode, board, runtime))
+
+            total_tasks = len(task_specs)
+            print(f"[Parallel benchmark] task_count={total_tasks}")
+
+            per_mode_results: dict[str, dict[int, PipelineMetrics]] = {mode: {} for mode in args.modes}
+            completed = 0
+            cancelled = 0
+            ctx = mp.get_context("spawn")
+            future_map = {}
+
+            with ProcessPoolExecutor(
+                max_workers=min(jobs, total_tasks),
+                mp_context=ctx,
+                initializer=_benchmark_worker_init,
+            ) as executor:
+                for spec in task_specs:
+                    fut = executor.submit(_benchmark_worker_run, *spec)
+                    future_map[fut] = spec[0]
+
+                for fut in as_completed(future_map):
+                    task_index = future_map[fut]
+                    mode, board_label = task_meta[task_index]
+                    try:
+                        idx_out, mode_out, payload = fut.result()
+                        per_mode_results[mode_out][idx_out] = PipelineMetrics.from_dict(payload)
+                        completed += 1
+                        print(
+                            f"[Parallel benchmark] completed {completed}/{total_tasks}"
+                            f" mode={mode_out} board={board_label}"
+                        )
+                    except Exception as exc:
+                        failed_tasks.append(
+                            {
+                                "mode": mode,
+                                "board": board_label,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        if args.failure_policy == "fail_fast":
+                            for pending in future_map:
+                                if not pending.done():
+                                    pending.cancel()
+                                    cancelled += 1
+                            raise ConfigError(
+                                f"Parallel benchmark task failed (mode={mode}, board={board_label}): {type(exc).__name__}: {exc}"
+                            ) from exc
+
+            cancelled += max(0, total_tasks - completed - len(failed_tasks))
+
+            for mode in args.modes:
+                ordered = [per_mode_results[mode][i] for i in sorted(per_mode_results[mode])]
+                for m in ordered:
+                    m.parallel_jobs = jobs
+                    m.parallel_enabled = jobs > 1
+                    m.parallel_tasks_submitted = total_tasks
+                    m.parallel_tasks_completed = completed
+                    m.parallel_tasks_cancelled = cancelled
+                metrics_by_mode[mode] = ordered
+                summary_by_mode[mode] = summarize_by_board(ordered, metric_keys) if ordered else {}
+                reasons_by_mode[mode] = _collect_reason_counts(ordered) if ordered else {}
 
         gates = {}
         if "fast" in summary_by_mode and "legacy" in summary_by_mode:
@@ -172,6 +300,9 @@ def main(argv=None) -> int:
             "summary_by_mode": summary_by_mode,
             "reason_counts_by_mode": reasons_by_mode,
             "gates": gates,
+            "parallel_jobs": jobs,
+            "failure_policy": args.failure_policy,
+            "failed_tasks": failed_tasks,
         }
         summary_json = out_root / "summary_ab.json"
         summary_csv = out_root / "summary_ab.csv"

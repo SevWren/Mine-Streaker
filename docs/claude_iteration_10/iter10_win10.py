@@ -49,6 +49,8 @@ def main(argv=None) -> int:
             argv=raw_argv,
             python_executable=Path(sys.executable),
         )
+        if int(args.board_jobs) < 1:
+            raise ConfigError(f"--board-jobs must be >= 1 (got {args.board_jobs})")
 
         if paths.out_dir == defaults.out_dir.resolve():
             paths = PathsConfig(
@@ -70,6 +72,7 @@ def main(argv=None) -> int:
             solver_mode=args.solver_mode,
             strict_repro=strict_repro,
             deterministic_order=args.deterministic_order,
+            board_jobs=int(args.board_jobs),
         )
         run_experiment(run_config)
         return 0

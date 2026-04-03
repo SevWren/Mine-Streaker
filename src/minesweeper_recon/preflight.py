@@ -76,6 +76,12 @@ def parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
         help="Disable strict reproducibility enforcement.",
     )
     parser.set_defaults(strict_repro=True)
+    parser.add_argument(
+        "--board-jobs",
+        type=int,
+        default=1,
+        help="Number of parallel board workers for iter10_win10 pipeline (default: 1).",
+    )
     return parser.parse_args(argv)
 
 

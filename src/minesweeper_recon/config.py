@@ -43,6 +43,9 @@ class RuntimeConfig:
     strict_repro: bool = True
     deterministic_order: Literal["auto", "on", "off"] = "auto"
     repair_global_cap_s: Optional[float] = None
+    board_jobs: int = 1
+    benchmark_jobs: int = 1
+    failure_policy: Literal["fail_fast", "continue"] = "fail_fast"
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,7 @@ def default_run_config(
     solver_mode: Literal["legacy", "fast"] = "fast",
     strict_repro: bool = True,
     deterministic_order: Literal["auto", "on", "off"] = "auto",
+    board_jobs: int = 1,
 ) -> RunConfig:
     runtime = RuntimeConfig(
         paths=paths or PathsConfig(),
@@ -101,5 +105,6 @@ def default_run_config(
         solver_mode=solver_mode,
         strict_repro=strict_repro,
         deterministic_order=deterministic_order,
+        board_jobs=max(1, int(board_jobs)),
     )
     return RunConfig(runtime=runtime, boards=default_boards())

@@ -61,6 +61,9 @@ From `--help`:
   - Default behavior.
 - `--no-strict-repro`
   - Disable strict reproducibility checks.
+- `--board-jobs BOARD_JOBS`
+  - Number of parallel worker processes for board execution.
+  - Default: `1`.
 
 ### `iter10_win10.py` mode examples
 
@@ -86,6 +89,12 @@ Non-strict run:
 
 ```powershell
 python iter10_win10.py --no-strict-repro
+```
+
+Parallel board run:
+
+```powershell
+python iter10_win10.py --board-jobs 2 --no-strict-repro --deterministic-order off
 ```
 
 Deterministic ordering explicitly on/off:
@@ -126,6 +135,13 @@ From `--help`:
   - Disable strict reproducibility checks.
 - `--repair-global-cap-s REPAIR_GLOBAL_CAP_S`
   - Optional override for combined Phase1+Phase2 repair cap (seconds).
+- `--jobs JOBS`
+  - Number of parallel worker processes for benchmark tasks.
+  - Default: `1`.
+- `--failure-policy {fail_fast,continue}`
+  - Worker failure behavior in parallel mode.
+  - `fail_fast` aborts on first failed task.
+  - `continue` records failed tasks and continues remaining tasks.
 - `--verbose`
   - Turn on verbose pipeline logs.
 
@@ -165,6 +181,12 @@ Non-strict faster benchmark:
 
 ```powershell
 python iter10_benchmark_ab.py --no-strict-repro --deterministic-order off
+```
+
+Parallel benchmark run:
+
+```powershell
+python iter10_benchmark_ab.py --jobs 4 --failure-policy fail_fast --no-strict-repro --deterministic-order off
 ```
 
 Apply a global repair cap:

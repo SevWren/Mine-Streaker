@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
@@ -20,6 +22,8 @@ from .report import render_report
 from .runtime import build_repro_fingerprint
 from .sa import compile_sa_kernel
 from .solver import solve_board
+
+_PIPELINE_WORKER_SA_FN = None
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
@@ -111,6 +115,19 @@ def _compute_adaptive_repair_budgets(
         "phase1_starved": bool(cap > 0.0 and phase1_budget <= 0.0),
         "global_cap_s": float(cap),
     }
+
+
+def _pipeline_worker_init() -> None:
+    global _PIPELINE_WORKER_SA_FN
+    _PIPELINE_WORKER_SA_FN = compile_sa_kernel()
+
+
+def _pipeline_worker_run(index: int, board: BoardConfig, runtime: RuntimeConfig) -> tuple[int, dict]:
+    global _PIPELINE_WORKER_SA_FN
+    if _PIPELINE_WORKER_SA_FN is None:
+        _PIPELINE_WORKER_SA_FN = compile_sa_kernel()
+    metrics = _run_board_with_kernel(board, runtime, _PIPELINE_WORKER_SA_FN)
+    return index, metrics.to_dict()
 
 
 def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -> PipelineMetrics:
@@ -401,6 +418,8 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
         deterministic_sort_time_s_total=round(float(solve_stats.get("sort_time_s", 0.0)), 6),
         repair_phase1_telemetry=phase1_telemetry,
         repair_phase2_telemetry=phase2_telemetry,
+        parallel_jobs=max(1, int(max(getattr(runtime, "board_jobs", 1), getattr(runtime, "benchmark_jobs", 1)))),
+        parallel_enabled=bool(max(getattr(runtime, "board_jobs", 1), getattr(runtime, "benchmark_jobs", 1)) > 1),
         repro_fingerprint=repro_fingerprint,
     )
 
@@ -442,14 +461,57 @@ def run_experiment(config: RunConfig) -> list[PipelineMetrics]:
     print(f"Input image: {config.runtime.paths.img}")
     print(f"Output dir:  {config.runtime.paths.out_dir}")
 
-    print("\n[Step 1] Kernel compilation")
-    sa_fn = compile_sa_kernel()
-
     all_metrics: list[PipelineMetrics] = []
-    for idx, board in enumerate(config.boards, start=2):
-        step_title = "Primary solvability target" if idx == 2 else "Scale test"
-        print(f"\n[Step {idx}] {board.label}   {step_title}")
-        all_metrics.append(_run_board_with_kernel(board, config.runtime, sa_fn))
+    board_jobs = max(1, int(getattr(config.runtime, "board_jobs", 1)))
+    tasks_submitted = len(config.boards)
+    tasks_completed = 0
+    tasks_cancelled = 0
+    if board_jobs <= 1 or len(config.boards) <= 1:
+        print("\n[Step 1] Kernel compilation")
+        sa_fn = compile_sa_kernel()
+        for idx, board in enumerate(config.boards, start=2):
+            step_title = "Primary solvability target" if idx == 2 else "Scale test"
+            print(f"\n[Step {idx}] {board.label}   {step_title}")
+            all_metrics.append(_run_board_with_kernel(board, config.runtime, sa_fn))
+        tasks_completed = len(all_metrics)
+    else:
+        workers = min(board_jobs, len(config.boards))
+        print(f"\n[Step 1] Parallel board execution  workers={workers}")
+        print("  Each worker compiles SA kernel once.")
+        ctx = mp.get_context("spawn")
+        future_map = {}
+        results: dict[int, PipelineMetrics] = {}
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=ctx,
+                initializer=_pipeline_worker_init,
+            ) as executor:
+                for idx, board in enumerate(config.boards):
+                    fut = executor.submit(_pipeline_worker_run, idx, board, config.runtime)
+                    future_map[fut] = idx
+                for fut in as_completed(future_map):
+                    idx = future_map[fut]
+                    idx_out, payload = fut.result()
+                    results[idx_out] = PipelineMetrics.from_dict(payload)
+                    tasks_completed += 1
+                    print(f"  [Parallel boards] completed {tasks_completed}/{tasks_submitted}: {config.boards[idx].label}")
+                all_metrics = [results[i] for i in range(len(config.boards))]
+        except Exception:
+            for fut in future_map:
+                fut.cancel()
+            tasks_cancelled = max(0, tasks_submitted - tasks_completed)
+            raise
+        tasks_cancelled = max(0, tasks_submitted - tasks_completed)
+
+    parallel_jobs = max(1, int(max(getattr(config.runtime, "board_jobs", 1), getattr(config.runtime, "benchmark_jobs", 1))))
+    parallel_enabled = bool(parallel_jobs > 1)
+    for m in all_metrics:
+        m.parallel_jobs = parallel_jobs
+        m.parallel_enabled = parallel_enabled
+        m.parallel_tasks_submitted = int(tasks_submitted)
+        m.parallel_tasks_completed = int(tasks_completed)
+        m.parallel_tasks_cancelled = int(tasks_cancelled)
 
     print("\n" + "=" * 68)
     print("ITERATION 10  FINAL SUMMARY")
