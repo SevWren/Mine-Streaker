@@ -299,6 +299,11 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
                 handoff_min_solves=6,
                 handoff_window=4,
                 handoff_min_rate=0.75,
+                solver_mode=runtime.solver_mode,
+                deterministic_solver=deterministic_enabled,
+                parallel_eval_jobs=max(1, int(getattr(runtime, "repair_eval_jobs", 1))),
+                parallel_eval_batch_size=max(0, int(getattr(runtime, "repair_eval_batch_size", 0))),
+                failure_policy=str(getattr(runtime, "failure_policy", "fail_fast")),
             )
         )
         grid = phase1.grid
@@ -327,6 +332,11 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
                 max_outer=300,
                 initial_solve_result=sr,
                 frontier_radius=3,
+                solver_mode=runtime.solver_mode,
+                deterministic_solver=deterministic_enabled,
+                parallel_eval_jobs=max(1, int(getattr(runtime, "repair_eval_jobs", 1))),
+                parallel_eval_batch_size=max(0, int(getattr(runtime, "repair_eval_batch_size", 0))),
+                failure_policy=str(getattr(runtime, "failure_policy", "fail_fast")),
             )
         )
         grid = phase2.grid
@@ -357,6 +367,11 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
                 verbose=runtime.verbose,
                 max_unknown=config.repair3_max_unknown,
                 initial_solve_result=sr,
+                solver_mode=runtime.solver_mode,
+                deterministic_solver=deterministic_enabled,
+                parallel_eval_jobs=max(1, int(getattr(runtime, "repair_eval_jobs", 1))),
+                parallel_eval_batch_size=max(0, int(getattr(runtime, "repair_eval_batch_size", 0))),
+                failure_policy=str(getattr(runtime, "failure_policy", "fail_fast")),
             )
         )
         grid = phase3.grid
@@ -374,6 +389,20 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
         solver_mode=runtime.solver_mode,
         strict_repro=runtime.strict_repro,
         deterministic_order=runtime.deterministic_order,
+    )
+    phase1_parallel_wall = float(phase1_telemetry.get("parallel_eval_wall_s", 0.0))
+    phase2_parallel_wall = float(phase2_telemetry.get("parallel_eval_wall_s", 0.0))
+    phase1_parallel_cpu = float(phase1_telemetry.get("parallel_eval_cpu_s", 0.0))
+    phase2_parallel_cpu = float(phase2_telemetry.get("parallel_eval_cpu_s", 0.0))
+    phase1_parallel_queue = float(phase1_telemetry.get("parallel_queue_wait_s", 0.0))
+    phase2_parallel_queue = float(phase2_telemetry.get("parallel_queue_wait_s", 0.0))
+    parallel_eval_wall_total = phase1_parallel_wall + phase2_parallel_wall
+    parallel_eval_cpu_total = phase1_parallel_cpu + phase2_parallel_cpu
+    parallel_queue_wait_total = phase1_parallel_queue + phase2_parallel_queue
+    parallel_speedup = (
+        parallel_eval_cpu_total / parallel_eval_wall_total
+        if parallel_eval_wall_total > 1e-9
+        else 0.0
     )
 
     metrics = PipelineMetrics(
@@ -420,6 +449,13 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
         repair_phase2_telemetry=phase2_telemetry,
         parallel_jobs=max(1, int(max(getattr(runtime, "board_jobs", 1), getattr(runtime, "benchmark_jobs", 1)))),
         parallel_enabled=bool(max(getattr(runtime, "board_jobs", 1), getattr(runtime, "benchmark_jobs", 1)) > 1),
+        parallel_tasks_submitted=1,
+        parallel_tasks_completed=1,
+        parallel_tasks_cancelled=0,
+        parallel_queue_wait_s=round(parallel_queue_wait_total, 4),
+        parallel_eval_wall_s=round(parallel_eval_wall_total, 4),
+        parallel_eval_cpu_s=round(parallel_eval_cpu_total, 4),
+        parallel_effective_speedup_est=round(parallel_speedup, 4),
         repro_fingerprint=repro_fingerprint,
     )
 

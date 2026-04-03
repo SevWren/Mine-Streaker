@@ -82,6 +82,12 @@ def parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
         default=1,
         help="Number of parallel board workers for iter10_win10 pipeline (default: 1).",
     )
+    parser.add_argument(
+        "--repair-eval-jobs",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes for repair candidate evaluation (default: 1).",
+    )
     return parser.parse_args(argv)
 
 

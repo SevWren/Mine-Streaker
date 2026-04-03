@@ -67,6 +67,11 @@ class RepairContext:
     handoff_min_solves: int = 6
     handoff_window: int = 4
     handoff_min_rate: float = 0.75
+    solver_mode: str = "fast"
+    deterministic_solver: bool = False
+    parallel_eval_jobs: int = 1
+    parallel_eval_batch_size: int = 0
+    failure_policy: str = "fail_fast"
 
 
 @dataclass
@@ -117,6 +122,10 @@ class PipelineMetrics:
     parallel_tasks_submitted: int = 0
     parallel_tasks_completed: int = 0
     parallel_tasks_cancelled: int = 0
+    parallel_queue_wait_s: float = 0.0
+    parallel_eval_wall_s: float = 0.0
+    parallel_eval_cpu_s: float = 0.0
+    parallel_effective_speedup_est: float = 0.0
     repro_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -167,6 +176,10 @@ class PipelineMetrics:
             "parallel_tasks_submitted": self.parallel_tasks_submitted,
             "parallel_tasks_completed": self.parallel_tasks_completed,
             "parallel_tasks_cancelled": self.parallel_tasks_cancelled,
+            "parallel_queue_wait_s": self.parallel_queue_wait_s,
+            "parallel_eval_wall_s": self.parallel_eval_wall_s,
+            "parallel_eval_cpu_s": self.parallel_eval_cpu_s,
+            "parallel_effective_speedup_est": self.parallel_effective_speedup_est,
             "repro_fingerprint": self.repro_fingerprint,
         }
 
@@ -219,5 +232,9 @@ class PipelineMetrics:
             parallel_tasks_submitted=int(payload.get("parallel_tasks_submitted", 0)),
             parallel_tasks_completed=int(payload.get("parallel_tasks_completed", 0)),
             parallel_tasks_cancelled=int(payload.get("parallel_tasks_cancelled", 0)),
+            parallel_queue_wait_s=float(payload.get("parallel_queue_wait_s", 0.0)),
+            parallel_eval_wall_s=float(payload.get("parallel_eval_wall_s", 0.0)),
+            parallel_eval_cpu_s=float(payload.get("parallel_eval_cpu_s", 0.0)),
+            parallel_effective_speedup_est=float(payload.get("parallel_effective_speedup_est", 0.0)),
             repro_fingerprint=str(payload.get("repro_fingerprint", "")),
         )

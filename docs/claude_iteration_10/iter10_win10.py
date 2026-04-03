@@ -51,6 +51,8 @@ def main(argv=None) -> int:
         )
         if int(args.board_jobs) < 1:
             raise ConfigError(f"--board-jobs must be >= 1 (got {args.board_jobs})")
+        if int(args.repair_eval_jobs) < 1:
+            raise ConfigError(f"--repair-eval-jobs must be >= 1 (got {args.repair_eval_jobs})")
 
         if paths.out_dir == defaults.out_dir.resolve():
             paths = PathsConfig(
@@ -73,6 +75,7 @@ def main(argv=None) -> int:
             strict_repro=strict_repro,
             deterministic_order=args.deterministic_order,
             board_jobs=int(args.board_jobs),
+            repair_eval_jobs=int(args.repair_eval_jobs),
         )
         run_experiment(run_config)
         return 0

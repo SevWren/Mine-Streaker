@@ -48,6 +48,12 @@ def _parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
     strict_group.add_argument("--no-strict-repro", dest="strict_repro", action="store_false", help="Disable strict reproducibility checks.")
     parser.set_defaults(strict_repro=True)
     parser.add_argument("--repair-global-cap-s", type=float, default=None, help="Optional global repair cap override in seconds.")
+    parser.add_argument(
+        "--repair-eval-jobs",
+        type=int,
+        default=1,
+        help="Parallel worker processes for repair candidate evaluation inside each board run (default: 1).",
+    )
     parser.add_argument("--jobs", type=int, default=1, help="Parallel worker processes for benchmark tasks (default: 1).")
     parser.add_argument(
         "--failure-policy",
@@ -125,6 +131,8 @@ def main(argv=None) -> int:
     try:
         if int(args.jobs) < 1:
             raise ConfigError(f"--jobs must be >= 1 (got {args.jobs})")
+        if int(args.repair_eval_jobs) < 1:
+            raise ConfigError(f"--repair-eval-jobs must be >= 1 (got {args.repair_eval_jobs})")
         script_path = Path(sys.argv[0]).resolve()
         reexec_code = maybe_reexec_with_strict_repro(
             strict_repro=bool(args.strict_repro),
@@ -183,10 +191,11 @@ def main(argv=None) -> int:
                     solver_mode=mode,
                     strict_repro=bool(args.strict_repro),
                     deterministic_order=args.deterministic_order,
-                    repair_global_cap_s=args.repair_global_cap_s,
-                    benchmark_jobs=jobs,
-                    failure_policy=args.failure_policy,
-                )
+                repair_global_cap_s=args.repair_global_cap_s,
+                benchmark_jobs=jobs,
+                repair_eval_jobs=int(args.repair_eval_jobs),
+                failure_policy=args.failure_policy,
+            )
                 run_cfg = RunConfig(runtime=runtime, boards=boards)
                 metrics = run_benchmark_matrix(run_cfg, boards=boards)
                 metrics_by_mode[mode] = metrics
@@ -212,6 +221,7 @@ def main(argv=None) -> int:
                     deterministic_order=args.deterministic_order,
                     repair_global_cap_s=args.repair_global_cap_s,
                     benchmark_jobs=jobs,
+                    repair_eval_jobs=int(args.repair_eval_jobs),
                     failure_policy=args.failure_policy,
                 )
                 for board in boards:
@@ -301,6 +311,7 @@ def main(argv=None) -> int:
             "reason_counts_by_mode": reasons_by_mode,
             "gates": gates,
             "parallel_jobs": jobs,
+            "repair_eval_jobs": int(args.repair_eval_jobs),
             "failure_policy": args.failure_policy,
             "failed_tasks": failed_tasks,
         }

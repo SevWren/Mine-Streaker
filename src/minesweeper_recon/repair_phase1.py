@@ -6,6 +6,7 @@ import numpy as np
 
 from .core import compute_N
 from .models import RepairContext, RepairResult, SolveResult
+from .parallel_eval import ParallelSolveEvaluator
 from .repair_prefilter import forcing_potential_score
 from .runtime import BudgetExceeded, check_deadline, now_s
 
@@ -42,12 +43,29 @@ def run_phase1_repair(context: RepairContext) -> RepairResult:
     candidate_gen_s = 0.0
     prefilter_s = 0.0
     selection_s = 0.0
+    parallel_eval_batches = 0
+    parallel_eval_submitted = 0
+    parallel_eval_completed = 0
+    parallel_eval_cancelled = 0
+    parallel_eval_failed = 0
+    parallel_eval_wall_s = 0.0
+    parallel_eval_cpu_s = 0.0
 
     max_rounds = context.max_rounds or 200
     search_radius = context.search_radius or 6
     checkpoint_every = context.checkpoint_every or 5
     deadline_s = context.deadline_s
     solve_cache: dict[tuple[tuple[int, int, int], ...], SolveResult] = {}
+    parallel_jobs = max(1, int(context.parallel_eval_jobs or 1))
+    parallel_batch_size = max(1, int(context.parallel_eval_batch_size or parallel_jobs))
+    evaluator: ParallelSolveEvaluator | None = None
+    if parallel_jobs > 1:
+        evaluator = ParallelSolveEvaluator(
+            jobs=parallel_jobs,
+            solver_mode=context.solver_mode,
+            deterministic=bool(context.deterministic_solver),
+            failure_policy=context.failure_policy,
+        )
 
     def deadline_reached() -> bool:
         return deadline_s is not None and now_s() >= deadline_s
@@ -97,6 +115,52 @@ def run_phase1_repair(context: RepairContext) -> RepairResult:
         full_evals += 1
         solve_cache[key] = sr_local
         return sr_local
+
+    def evaluate_candidate_batch(keys: list[tuple[tuple[int, int, int], ...]]) -> dict[tuple[tuple[int, int, int], ...], SolveResult]:
+        nonlocal cache_hits, cache_misses, full_evals, full_eval_time_s, solve_time_s, solve_calls
+        nonlocal parallel_eval_batches, parallel_eval_submitted, parallel_eval_completed
+        nonlocal parallel_eval_cancelled, parallel_eval_failed, parallel_eval_wall_s, parallel_eval_cpu_s
+        out: dict[tuple[tuple[int, int, int], ...], SolveResult] = {}
+        misses: list[tuple[tuple[int, int, int], ...]] = []
+        for key in keys:
+            cached = solve_cache.get(key)
+            if cached is not None:
+                cache_hits += 1
+                out[key] = cached
+            else:
+                cache_misses += 1
+                misses.append(key)
+        if not misses:
+            return out
+
+        if evaluator is None or len(misses) == 1:
+            for key in misses:
+                cy, cx, _ = key[0]
+                sr_local = evaluate_candidate_remove(cy, cx)
+                out[key] = sr_local
+            return out
+
+        check_deadline(deadline_s, "phase1_repair_parallel_batch")
+        batch_results, batch_stats = evaluator.evaluate_batch(best, misses, deadline_s=deadline_s)
+        parallel_eval_batches += 1
+        parallel_eval_submitted += int(batch_stats.get("submitted", 0))
+        parallel_eval_completed += int(batch_stats.get("completed", 0))
+        parallel_eval_cancelled += int(batch_stats.get("cancelled", 0))
+        parallel_eval_failed += int(batch_stats.get("failed", 0))
+        parallel_eval_wall_s += float(batch_stats.get("wall_s", 0.0))
+        parallel_eval_cpu_s += float(batch_stats.get("cpu_s", 0.0))
+
+        wall = float(batch_stats.get("wall_s", 0.0))
+        solve_time_s += wall
+        full_eval_time_s += wall
+        completed = int(batch_stats.get("completed", 0))
+        full_evals += completed
+        solve_calls += completed
+
+        for key, sr_local in batch_results.items():
+            solve_cache[key] = sr_local
+            out[key] = sr_local
+        return out
 
     try:
         if context.initial_solve_result is not None:
@@ -149,159 +213,181 @@ def run_phase1_repair(context: RepairContext) -> RepairResult:
     if context.verbose:
         print(f"  Pre-repair: cov={best_cov:.4f}  unknown={best_unk}  budget={context.time_budget_s:.0f}s")
 
-    for rnd in range(max_rounds):
-        elapsed = now_s() - t_start
-        if elapsed >= context.time_budget_s:
-            stop_reason = f"timeout ({elapsed:.0f}s)"
-            break
-        if best_cov >= 0.9999:
-            stop_reason = "converged"
-            break
-
-        sr = best_sr
-        unknown_list = sorted(sr.unknown)
-        if not unknown_list:
-            stop_reason = "no_unknowns"
-            break
-
-        t_stage = now_s()
-        cand_score: dict[tuple[int, int], int] = {}
-        for u_i, (uy, ux) in enumerate(unknown_list):
-            if u_i % 32 == 0 and deadline_reached():
-                stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
+    try:
+        for rnd in range(max_rounds):
+            elapsed = now_s() - t_start
+            if elapsed >= context.time_budget_s:
+                stop_reason = f"timeout ({elapsed:.0f}s)"
                 break
-            for dy in range(-search_radius, search_radius + 1):
-                for dx in range(-search_radius, search_radius + 1):
-                    ny, nx = uy + dy, ux + dx
-                    if 0 <= ny < H and 0 <= nx < W and best[ny, nx] == 1 and forbidden[ny, nx] == 0:
-                        cand_score[(ny, nx)] = cand_score.get((ny, nx), 0) + 1
-        candidate_gen_s += now_s() - t_stage
-        if stop_reason.startswith("timeout"):
-            break
-
-        if not cand_score:
-            stop_reason = "no_candidates"
-            break
-
-        avg_solve_s = solve_time_s / max(solve_calls, 1)
-        remaining_s = max(0.0, deadline_s - now_s()) if deadline_s is not None else 10.0
-        affordable_solves = max(1, int(remaining_s / max(avg_solve_s, 0.05)))
-        eval_cap = min(10, max(1, affordable_solves - 1))
-        top_cap = min(120, max(30, eval_cap * 8))
-        top = sorted(cand_score.items(), key=lambda x: -x[1])[:top_cap]
-        if not top:
-            stop_reason = "no_candidates"
-            break
-
-        t_stage = now_s()
-        fallback_cells = {cell for cell, _ in top[:3]}
-        N_cur = compute_N(best)
-        gated: list[tuple[tuple[int, int], int]] = []
-        for (cy, cx), score in top:
-            prefilter_total += 1
-            pass_gate = (cy, cx) in fallback_cells
-            if not pass_gate:
-                forcing_score = forcing_potential_score(
-                    N_cur=N_cur,
-                    edits=[(cy, cx, -1)],
-                    revealed=sr.revealed,
-                    flagged=sr.flagged,
-                    H=H,
-                    W=W,
-                    frontier_radius=context.frontier_radius,
-                )
-                pass_gate = forcing_score >= 1
-            if pass_gate:
-                prefilter_passed += 1
-                gated.append(((cy, cx), score))
-            else:
-                prefilter_rejected += 1
-        prefilter_s += now_s() - t_stage
-
-        accepted = None
-        evaluated_keys: set[tuple[tuple[int, int, int], ...]] = set()
-
-        t_stage = now_s()
-        for (cy, cx), _ in gated[:eval_cap]:
-            key = _candidate_key(((cy, cx, -1),))
-            if key in evaluated_keys:
-                duplicate_eval_skipped += 1
-                continue
-            evaluated_keys.add(key)
-
-            try:
-                new_sr = evaluate_candidate_remove(cy, cx)
-            except BudgetExceeded:
-                stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
+            if best_cov >= 0.9999:
+                stop_reason = "converged"
                 break
 
-            if new_sr.coverage >= best_cov - 0.0001:
-                if new_sr.n_unknown < best_unk or new_sr.coverage > best_cov + 0.0001:
-                    accepted = (cy, cx, new_sr)
+            sr = best_sr
+            unknown_list = sorted(sr.unknown)
+            if not unknown_list:
+                stop_reason = "no_unknowns"
+                break
+
+            t_stage = now_s()
+            cand_score: dict[tuple[int, int], int] = {}
+            for u_i, (uy, ux) in enumerate(unknown_list):
+                if u_i % 32 == 0 and deadline_reached():
+                    stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                     break
-            best_unk_history.append(best_unk)
-            if should_handoff_low_yield():
-                stop_reason = "handoff_low_yield"
+                for dy in range(-search_radius, search_radius + 1):
+                    for dx in range(-search_radius, search_radius + 1):
+                        ny, nx = uy + dy, ux + dx
+                        if 0 <= ny < H and 0 <= nx < W and best[ny, nx] == 1 and forbidden[ny, nx] == 0:
+                            cand_score[(ny, nx)] = cand_score.get((ny, nx), 0) + 1
+            candidate_gen_s += now_s() - t_stage
+            if stop_reason.startswith("timeout"):
                 break
-        if stop_reason.startswith("timeout"):
-            selection_s += now_s() - t_stage
-            break
-        if stop_reason == "handoff_low_yield":
-            selection_s += now_s() - t_stage
-            break
 
-        if accepted is None and gated:
-            fallback_cell = None
-            for (cy, cx), _ in gated:
-                key = _candidate_key(((cy, cx, -1),))
-                if key not in evaluated_keys:
-                    fallback_cell = (cy, cx)
-                    break
+            if not cand_score:
+                stop_reason = "no_candidates"
+                break
 
-            if fallback_cell is None:
-                fallback_skipped_already_evaluated += 1
-            else:
-                cy, cx = fallback_cell
+            avg_solve_s = solve_time_s / max(solve_calls, 1)
+            remaining_s = max(0.0, deadline_s - now_s()) if deadline_s is not None else 10.0
+            affordable_solves = max(1, int(remaining_s / max(avg_solve_s, 0.05)))
+            eval_cap = min(10, max(1, affordable_solves - 1))
+            top_cap = min(120, max(30, eval_cap * 8))
+            top = sorted(cand_score.items(), key=lambda x: -x[1])[:top_cap]
+            if not top:
+                stop_reason = "no_candidates"
+                break
+
+            t_stage = now_s()
+            fallback_cells = {cell for cell, _ in top[:3]}
+            N_cur = compute_N(best)
+            gated: list[tuple[tuple[int, int], int]] = []
+            for (cy, cx), score in top:
+                prefilter_total += 1
+                pass_gate = (cy, cx) in fallback_cells
+                if not pass_gate:
+                    forcing_score = forcing_potential_score(
+                        N_cur=N_cur,
+                        edits=[(cy, cx, -1)],
+                        revealed=sr.revealed,
+                        flagged=sr.flagged,
+                        H=H,
+                        W=W,
+                        frontier_radius=context.frontier_radius,
+                    )
+                    pass_gate = forcing_score >= 1
+                if pass_gate:
+                    prefilter_passed += 1
+                    gated.append(((cy, cx), score))
+                else:
+                    prefilter_rejected += 1
+            prefilter_s += now_s() - t_stage
+
+            accepted = None
+            evaluated_keys: set[tuple[tuple[int, int, int], ...]] = set()
+
+            t_stage = now_s()
+            eval_cells = [cell for cell, _ in gated[:eval_cap]]
+            eval_cursor = 0
+            while eval_cursor < len(eval_cells):
+                batch_cells = eval_cells[eval_cursor : eval_cursor + parallel_batch_size]
+                eval_cursor += len(batch_cells)
+                batch_keys: list[tuple[tuple[int, int, int], ...]] = []
+                ordered_batch: list[tuple[int, int, tuple[tuple[int, int, int], ...]]] = []
+                for cy, cx in batch_cells:
+                    key = _candidate_key(((cy, cx, -1),))
+                    if key in evaluated_keys:
+                        duplicate_eval_skipped += 1
+                        continue
+                    evaluated_keys.add(key)
+                    ordered_batch.append((cy, cx, key))
+                    batch_keys.append(key)
+
+                if not batch_keys:
+                    continue
+
                 try:
-                    new_sr = evaluate_candidate_remove(cy, cx)
+                    batch_results = evaluate_candidate_batch(batch_keys)
                 except BudgetExceeded:
                     stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
-                    selection_s += now_s() - t_stage
                     break
-                if new_sr.coverage >= best_cov - 0.0001:
-                    accepted = (cy, cx, new_sr)
-                if accepted is None:
+
+                for cy, cx, key in ordered_batch:
+                    new_sr = batch_results.get(key)
+                    if new_sr is None:
+                        continue
+                    if new_sr.coverage >= best_cov - 0.0001:
+                        if new_sr.n_unknown < best_unk or new_sr.coverage > best_cov + 0.0001:
+                            accepted = (cy, cx, new_sr)
+                            break
                     best_unk_history.append(best_unk)
                     if should_handoff_low_yield():
                         stop_reason = "handoff_low_yield"
+                        break
+                if accepted is not None or stop_reason == "handoff_low_yield":
+                    break
+            if stop_reason.startswith("timeout"):
+                selection_s += now_s() - t_stage
+                break
+            if stop_reason == "handoff_low_yield":
+                selection_s += now_s() - t_stage
+                break
+
+            if accepted is None and gated:
+                fallback_cell = None
+                for (cy, cx), _ in gated:
+                    key = _candidate_key(((cy, cx, -1),))
+                    if key not in evaluated_keys:
+                        fallback_cell = (cy, cx)
+                        break
+
+                if fallback_cell is None:
+                    fallback_skipped_already_evaluated += 1
+                else:
+                    cy, cx = fallback_cell
+                    try:
+                        new_sr = evaluate_candidate_batch([_candidate_key(((cy, cx, -1),))]).get(_candidate_key(((cy, cx, -1),)))
+                    except BudgetExceeded:
+                        stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
                         selection_s += now_s() - t_stage
                         break
-        selection_s += now_s() - t_stage
-        if stop_reason == "handoff_low_yield":
-            break
-
-        if accepted:
-            cy, cx, new_sr = accepted
-            best[cy, cx] = 0
-            solve_cache.clear()
-            best_sr = new_sr
-            best_cov = new_sr.coverage
-            best_unk = new_sr.n_unknown
-            best_unk_history.append(best_unk)
-            no_improve_rounds = 0
-            if ckpt_path and (rnd + 1) % checkpoint_every == 0:
-                np.save(ckpt_path, best)
-                if context.verbose:
-                    print(
-                        f"  Round {rnd+1:>4d}: cov={best_cov:.4f}"
-                        f"  unknown={best_unk:>5d}"
-                        f"  t={now_s()-t_start:.0f}s"
-                    )
-        else:
-            no_improve_rounds += 1
-            if no_improve_rounds >= 6:
-                stop_reason = "stagnated"
+                    if new_sr is not None and new_sr.coverage >= best_cov - 0.0001:
+                        accepted = (cy, cx, new_sr)
+                    if accepted is None:
+                        best_unk_history.append(best_unk)
+                        if should_handoff_low_yield():
+                            stop_reason = "handoff_low_yield"
+                            selection_s += now_s() - t_stage
+                            break
+            selection_s += now_s() - t_stage
+            if stop_reason == "handoff_low_yield":
                 break
+
+            if accepted:
+                cy, cx, new_sr = accepted
+                best[cy, cx] = 0
+                solve_cache.clear()
+                best_sr = new_sr
+                best_cov = new_sr.coverage
+                best_unk = new_sr.n_unknown
+                best_unk_history.append(best_unk)
+                no_improve_rounds = 0
+                if ckpt_path and (rnd + 1) % checkpoint_every == 0:
+                    np.save(ckpt_path, best)
+                    if context.verbose:
+                        print(
+                            f"  Round {rnd+1:>4d}: cov={best_cov:.4f}"
+                            f"  unknown={best_unk:>5d}"
+                            f"  t={now_s()-t_start:.0f}s"
+                        )
+            else:
+                no_improve_rounds += 1
+                if no_improve_rounds >= 6:
+                    stop_reason = "stagnated"
+                    break
+    finally:
+        if evaluator is not None:
+            evaluator.close()
 
     if stop_reason in ("converged", "no_unknowns") and ckpt_path and os.path.exists(ckpt_path):
         os.remove(ckpt_path)
@@ -332,6 +418,13 @@ def run_phase1_repair(context: RepairContext) -> RepairResult:
         "full_eval_s": round(full_eval_time_s, 4),
         "selection_s": round(selection_s, 4),
         "solve_wait_s": round(solve_time_s, 4),
+        "parallel_eval_batches": int(parallel_eval_batches),
+        "parallel_eval_submitted": int(parallel_eval_submitted),
+        "parallel_eval_completed": int(parallel_eval_completed),
+        "parallel_eval_cancelled": int(parallel_eval_cancelled),
+        "parallel_eval_failed": int(parallel_eval_failed),
+        "parallel_eval_wall_s": round(parallel_eval_wall_s, 4),
+        "parallel_eval_cpu_s": round(parallel_eval_cpu_s, 4),
         "total_s": round(elapsed_total, 4),
         "candidate_gen_pct": _pct(candidate_gen_s, elapsed_total),
         "prefilter_pct": _pct(prefilter_s, elapsed_total),

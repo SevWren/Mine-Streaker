@@ -45,6 +45,8 @@ class RuntimeConfig:
     repair_global_cap_s: Optional[float] = None
     board_jobs: int = 1
     benchmark_jobs: int = 1
+    repair_eval_jobs: int = 1
+    repair_eval_batch_size: int = 0
     failure_policy: Literal["fail_fast", "continue"] = "fail_fast"
 
 
@@ -98,6 +100,7 @@ def default_run_config(
     strict_repro: bool = True,
     deterministic_order: Literal["auto", "on", "off"] = "auto",
     board_jobs: int = 1,
+    repair_eval_jobs: int = 1,
 ) -> RunConfig:
     runtime = RuntimeConfig(
         paths=paths or PathsConfig(),
@@ -106,5 +109,6 @@ def default_run_config(
         strict_repro=strict_repro,
         deterministic_order=deterministic_order,
         board_jobs=max(1, int(board_jobs)),
+        repair_eval_jobs=max(1, int(repair_eval_jobs)),
     )
     return RunConfig(runtime=runtime, boards=default_boards())
