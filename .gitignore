@@ -215,3 +215,24 @@ results/**
 *.bak
 *.tmp
 *.temp
+
+# Ignore image/design files by default (explicit allowlist below)
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.psd
+*.ai
+
+# Image/design allowlist
+!**/2-Figure2-LeftMain.aiease.jpg
+!**/2-Figure2-LeftMain.aiease.psd.png
+!**/2-Figure2-LeftMain.png
+!**/input_source_image-left.png
+!**/2-Figure2-1.png
+!**/2-Figure2-LeftMain.aiease.psd
+!**/2-Figure2-LeftMain.aiease.psd.solid.png
