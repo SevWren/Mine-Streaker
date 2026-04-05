@@ -69,6 +69,121 @@ def _pct(part: float, total: float) -> float:
     return round(100.0 * part / total, 2)
 
 
+def _local_loss_delta_estimate(
+    N_cur: np.ndarray,
+    target: np.ndarray,
+    weights: np.ndarray,
+    edits: tuple[tuple[int, int, int], ...],
+    H: int,
+    W: int,
+) -> float:
+    delta_map: dict[tuple[int, int], int] = {}
+    for y, x, mine_delta in edits:
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < H and 0 <= nx < W:
+                    delta_map[(ny, nx)] = delta_map.get((ny, nx), 0) + int(mine_delta)
+    d_loss = 0.0
+    for (ny, nx), delta in delta_map.items():
+        n0 = float(N_cur[ny, nx])
+        n1 = n0 + float(delta)
+        if n1 < 0.0 or n1 > 8.0:
+            return float("inf")
+        diff0 = n0 - float(target[ny, nx])
+        diff1 = n1 - float(target[ny, nx])
+        d_loss += float(weights[ny, nx]) * (diff1 * diff1 - diff0 * diff0)
+    return float(d_loss)
+
+
+def _select_hotspot_unknowns(
+    unknown_list: list[tuple[int, int]],
+    *,
+    top_k: int,
+    radius: int,
+    cap: int,
+) -> tuple[list[tuple[int, int]], int]:
+    if not unknown_list:
+        return [], 0
+    top_k = max(1, int(top_k))
+    radius = max(1, int(radius))
+    cap = max(1, int(cap))
+    unknown_set = set(unknown_list)
+    scores: list[tuple[int, int, int]] = []
+    for y, x in unknown_list:
+        score = 0
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if (y + dy, x + dx) in unknown_set:
+                    score += 1
+        scores.append((score, y, x))
+    anchors = sorted(scores, key=lambda t: (-t[0], t[1], t[2]))[:top_k]
+    selected: set[tuple[int, int]] = set()
+    for _, ay, ax in anchors:
+        for y, x in unknown_list:
+            if abs(y - ay) <= radius and abs(x - ax) <= radius:
+                selected.add((y, x))
+    if not selected:
+        selected = set(unknown_list[:cap])
+    out = sorted(selected)
+    if len(out) > cap:
+        out = out[:cap]
+    return out, len(selected)
+
+
+def _build_beam_keys(
+    actions: list[tuple[float, tuple[tuple[int, int, int], ...], tuple[tuple[int, int], ...]]],
+    *,
+    depth: int,
+    width: int,
+    branch: int,
+    shortlist: int,
+) -> tuple[list[tuple[tuple[int, int, int], ...]], int]:
+    if not actions:
+        return [], 0
+    depth = max(1, int(depth))
+    width = max(1, int(width))
+    branch = max(1, int(branch))
+    shortlist = max(1, int(shortlist))
+    sorted_actions = sorted(actions, key=lambda t: (-float(t[0]), t[1]))
+
+    frontier: list[tuple[float, tuple[tuple[int, int, int], ...], frozenset[tuple[int, int]]]] = [
+        (0.0, tuple(), frozenset())
+    ]
+    scored_keys: dict[tuple[tuple[int, int, int], ...], float] = {}
+
+    for action_score, action_key, _ in sorted_actions:
+        scored_keys.setdefault(action_key, float(action_score))
+
+    for _ in range(depth):
+        next_nodes: list[tuple[float, tuple[tuple[int, int, int], ...], frozenset[tuple[int, int]]]] = []
+        for node_score, node_key, node_used in frontier:
+            expansions = 0
+            for action_score, action_key, action_cells in sorted_actions:
+                if expansions >= branch:
+                    break
+                action_cell_set = frozenset(action_cells)
+                if node_used & action_cell_set:
+                    continue
+                merged_key = _candidate_key(node_key + action_key)
+                merged_score = float(node_score) + float(action_score)
+                merged_used = frozenset(set(node_used) | set(action_cell_set))
+                prior = scored_keys.get(merged_key)
+                if prior is None or merged_score > prior:
+                    scored_keys[merged_key] = merged_score
+                next_nodes.append((merged_score, merged_key, merged_used))
+                expansions += 1
+        if not next_nodes:
+            break
+        next_nodes = sorted(next_nodes, key=lambda t: (-float(t[0]), t[1]))[:width]
+        frontier = next_nodes
+
+    ranked = sorted(scored_keys.items(), key=lambda kv: (-float(kv[1]), kv[0]))
+    return [key for key, _ in ranked[:shortlist]], len(scored_keys)
+
+
 def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
     H, W = context.grid.shape
     t_start = now_s()
@@ -108,6 +223,10 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
     parallel_eval_cpu_s = 0.0
     batch_timeout_count = 0
     deadline_preemptions = 0
+    hotspot_unknown_scanned = 0
+    beam_candidates = 0
+    heuristic_shortlist = 0
+    fullsolve_finalists = 0
 
     max_outer = context.max_outer or 200
     max_mines = 16
@@ -116,6 +235,13 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
     max_swap_eval = 12
     max_remove_eval = 8
     scan_unknown_cap = 256
+    hotspot_top_k = max(1, int(getattr(context, "phase2_hotspot_top_k", 6)))
+    hotspot_radius = max(1, int(getattr(context, "phase2_hotspot_radius", 6)))
+    delta_shortlist_cap = max(1, int(getattr(context, "phase2_delta_shortlist", 24)))
+    beam_width = max(1, int(getattr(context, "phase2_beam_width", 6)))
+    beam_depth = max(1, int(getattr(context, "phase2_beam_depth", 2)))
+    beam_branch = max(1, int(getattr(context, "phase2_beam_branch", 8)))
+    fullsolve_cap_cfg = max(1, int(getattr(context, "phase2_fullsolve_cap", 8)))
     solve_cache: dict[tuple[tuple[int, int, int], ...], SolveResult] = {}
     parallel_jobs = max(1, int(context.parallel_eval_jobs or 1))
     parallel_batch_size = max(1, int(context.parallel_eval_batch_size or parallel_jobs))
@@ -263,13 +389,15 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
                 stop_reason = "solved"
                 break
 
-            unknown_set = best_sr.unknown
+            unknown_set = {(int(y), int(x)) for y, x in best_sr.unknown}
             unknown_list = sorted(unknown_set)
-            if len(unknown_list) > scan_unknown_cap:
-                stride = max(1, len(unknown_list) // scan_unknown_cap)
-                scan_unknown = unknown_list[::stride][:scan_unknown_cap]
-            else:
-                scan_unknown = unknown_list
+            scan_unknown, selected_hotspot_total = _select_hotspot_unknowns(
+                unknown_list,
+                top_k=hotspot_top_k,
+                radius=hotspot_radius,
+                cap=scan_unknown_cap,
+            )
+            hotspot_unknown_scanned += len(scan_unknown)
 
             t_stage = now_s()
             mine_scores = {}
@@ -417,8 +545,9 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
             eval_seen: set[tuple[tuple[int, int, int], ...]] = set()
 
             t_stage = now_s()
-            swap_candidates: list[tuple[float, int, int, int, int, tuple[tuple[int, int, int], ...]]] = []
-            for score, my, mx, ty, tx in gated_swaps[:swap_eval_cap]:
+            action_limit = max(swap_eval_cap * 3, beam_branch * beam_width)
+            actions: list[tuple[float, tuple[tuple[int, int, int], ...], tuple[tuple[int, int], ...]]] = []
+            for score, my, mx, ty, tx in gated_swaps[:action_limit]:
                 if context.forbidden[ty, tx] == 1:
                     continue
                 key = _candidate_key(((my, mx, -1), (ty, tx, 1)))
@@ -426,96 +555,99 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
                     duplicate_eval_skipped += 1
                     continue
                 eval_seen.add(key)
-                swap_candidates.append((score, my, mx, ty, tx, key))
+                d_est = _local_loss_delta_estimate(N_cur, context.target, context.weights, key, H, W)
+                if not np.isfinite(d_est):
+                    continue
+                heuristic = float(score) - 0.10 * float(d_est)
+                actions.append((heuristic, key, ((my, mx), (ty, tx))))
 
-            swap_cursor = 0
-            while swap_cursor < len(swap_candidates):
-                if deadline_reached():
-                    deadline_preemptions += 1
-                    stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
-                    break
-                batch = swap_candidates[swap_cursor : swap_cursor + parallel_batch_size]
-                swap_cursor += len(batch)
-                batch_keys = [key for _, _, _, _, _, key in batch]
-                try:
-                    batch_results = evaluate_edits_batch(batch_keys)
-                except BudgetExceeded:
-                    batch_timeout_count += 1
-                    stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
-                    break
-                for score, my, mx, ty, tx, key in batch:
-                    new_sr = batch_results.get(key)
-                    if new_sr is None:
-                        continue
-                    if new_sr.n_unknown < best_unk or (new_sr.n_unknown == best_unk and new_sr.coverage > best_cov + 0.001):
-                        best[my, mx] = 0
-                        best[ty, tx] = 1
+            remove_limit = max(remove_eval_cap * 2, beam_branch)
+            for (my, mx), mine_score in sorted_mines[:remove_limit]:
+                key = _candidate_key(((my, mx, -1),))
+                if key in eval_seen:
+                    duplicate_eval_skipped += 1
+                    continue
+                eval_seen.add(key)
+                d_est = _local_loss_delta_estimate(N_cur, context.target, context.weights, key, H, W)
+                if not np.isfinite(d_est):
+                    continue
+                heuristic = float(mine_score) * 0.25 - 0.08 * float(d_est)
+                actions.append((heuristic, key, ((my, mx),)))
+
+            if not actions:
+                fallback_skipped_already_evaluated += 1
+            else:
+                shortlist_cap = min(max(4, delta_shortlist_cap), max(4, affordable_solves * 3))
+                beam_keys, beam_total = _build_beam_keys(
+                    actions,
+                    depth=beam_depth,
+                    width=beam_width,
+                    branch=beam_branch,
+                    shortlist=shortlist_cap,
+                )
+                beam_candidates += int(beam_total)
+                heuristic_shortlist += len(beam_keys)
+
+                finalist_cap = min(len(beam_keys), fullsolve_cap_cfg, max(1, affordable_solves - 1))
+                finalist_keys = beam_keys[:finalist_cap]
+                fullsolve_finalists += len(finalist_keys)
+
+                if finalist_keys:
+                    try:
+                        batch_results = evaluate_edits_batch(finalist_keys)
+                    except BudgetExceeded:
+                        batch_timeout_count += 1
+                        stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
+                        batch_results = {}
+
+                    best_key = None
+                    best_candidate_sr = None
+                    for key in finalist_keys:
+                        new_sr = batch_results.get(key)
+                        if new_sr is None:
+                            continue
+                        if best_candidate_sr is None:
+                            best_candidate_sr = new_sr
+                            best_key = key
+                            continue
+                        if int(new_sr.n_unknown) < int(best_candidate_sr.n_unknown):
+                            best_candidate_sr = new_sr
+                            best_key = key
+                            continue
+                        if (
+                            int(new_sr.n_unknown) == int(best_candidate_sr.n_unknown)
+                            and float(new_sr.coverage) > float(best_candidate_sr.coverage) + 0.001
+                        ):
+                            best_candidate_sr = new_sr
+                            best_key = key
+
+                    if (
+                        best_key is not None
+                        and best_candidate_sr is not None
+                        and (
+                            int(best_candidate_sr.n_unknown) < int(best_unk)
+                            or (
+                                int(best_candidate_sr.n_unknown) == int(best_unk)
+                                and float(best_candidate_sr.coverage) > float(best_cov) + 0.001
+                            )
+                        )
+                    ):
+                        for y, x, delta in best_key:
+                            best[y, x] = 1 if int(delta) > 0 else 0
                         solve_cache.clear()
-                        best_sr = new_sr
-                        best_unk = new_sr.n_unknown
-                        best_cov = new_sr.coverage
+                        best_sr = best_candidate_sr
+                        best_unk = int(best_candidate_sr.n_unknown)
+                        best_cov = float(best_candidate_sr.coverage)
                         N_cur = compute_N(best)
                         improved = True
                         if context.verbose:
                             print(
-                                f"  Swap {outer+1:>3d}: ({my},{mx})({ty},{tx})"
-                                f"  score={score:.1f}"
+                                f"  Beam {outer+1:>3d}: edits={len(best_key)}"
                                 f"  unknown={best_unk}  cov={best_cov:.4f}"
+                                f"  finalists={len(finalist_keys)}"
                                 f"  t={now_s()-t_start:.0f}s"
                             )
-                        break
-                if improved:
-                    break
             selection_s += now_s() - t_stage
-            if stop_reason.startswith("timeout"):
-                break
-
-            if not improved:
-                t_stage = now_s()
-                remove_candidates: list[tuple[int, int, tuple[tuple[int, int, int], ...]]] = []
-                for (my, mx), _ in sorted_mines[:remove_eval_cap]:
-                    key = _candidate_key(((my, mx, -1),))
-                    if key in eval_seen:
-                        duplicate_eval_skipped += 1
-                        continue
-                    eval_seen.add(key)
-                    remove_candidates.append((my, mx, key))
-                if not remove_candidates:
-                    fallback_skipped_already_evaluated += 1
-
-                remove_cursor = 0
-                while remove_cursor < len(remove_candidates):
-                    if deadline_reached():
-                        deadline_preemptions += 1
-                        stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
-                        break
-                    batch = remove_candidates[remove_cursor : remove_cursor + parallel_batch_size]
-                    remove_cursor += len(batch)
-                    batch_keys = [key for _, _, key in batch]
-                    try:
-                        batch_results = evaluate_edits_batch(batch_keys)
-                    except BudgetExceeded:
-                        batch_timeout_count += 1
-                        stop_reason = f"timeout ({now_s()-t_start:.0f}s)"
-                        break
-                    for my, mx, key in batch:
-                        new_sr = batch_results.get(key)
-                        if new_sr is None:
-                            continue
-                        if new_sr.n_unknown < best_unk or new_sr.coverage > best_cov + 0.001:
-                            best[my, mx] = 0
-                            solve_cache.clear()
-                            best_sr = new_sr
-                            best_unk = new_sr.n_unknown
-                            best_cov = new_sr.coverage
-                            N_cur = compute_N(best)
-                            improved = True
-                            if context.verbose:
-                                print(f"  Remove {outer+1:>3d}: ({my},{mx})  unknown={best_unk}  cov={best_cov:.4f}")
-                            break
-                    if improved:
-                        break
-                selection_s += now_s() - t_stage
             if stop_reason.startswith("timeout"):
                 break
 
@@ -583,6 +715,10 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
         "worker_failures": int(parallel_eval_failed),
         "deadline_preemptions": int(deadline_preemptions),
         "deadline_abort_batches": int(batch_timeout_count),
+        "hotspot_unknown_scanned": int(hotspot_unknown_scanned),
+        "beam_candidates": int(beam_candidates),
+        "heuristic_shortlist": int(heuristic_shortlist),
+        "fullsolve_finalists": int(fullsolve_finalists),
         "total_s": round(elapsed, 4),
         "mine_scan_pct": _pct(mine_scan_s, elapsed),
         "target_scan_pct": _pct(target_scan_s, elapsed),

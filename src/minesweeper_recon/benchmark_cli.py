@@ -26,9 +26,9 @@ _BENCHMARK_WORKER_SA_FN = None
 
 
 def _parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Iteration 10 A/B benchmark matrix and emit gate report.")
+    parser = argparse.ArgumentParser(description="Run Iteration 12 A/B benchmark matrix and emit gate report.")
     parser.add_argument("--img", default=str(defaults.img), help="Input source image path.")
-    parser.add_argument("--out", default=str(defaults.repo_root / "results" / "iter10_win10_ab"), help="Output root directory.")
+    parser.add_argument("--out", default=str(defaults.repo_root / "results" / "iter12" / "iter12_win12_ab"), help="Output root directory.")
     parser.add_argument("--modes", nargs="+", choices=("legacy", "fast"), default=["legacy", "fast"], help="Solver modes to benchmark.")
     parser.add_argument("--seeds", nargs="+", type=int, default=[300, 301, 302], help="Random seeds.")
     parser.add_argument(
@@ -95,7 +95,12 @@ def _collect_reason_counts(metrics) -> dict[str, dict[str, dict[str, int]]]:
     return out
 
 
-def _write_summary_csv(path: Path, summary_by_mode: dict[str, dict[str, dict[str, dict[str, float | int]]]], gates: dict[str, object]) -> None:
+def _write_summary_csv(
+    path: Path,
+    summary_by_mode: dict[str, dict[str, dict[str, dict[str, float | int]]]],
+    gates: dict[str, object],
+    metrics_by_mode: dict[str, list[PipelineMetrics]],
+) -> None:
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["section", "mode", "board", "metric", "median", "min", "max", "n", "result"])
@@ -113,6 +118,32 @@ def _write_summary_csv(path: Path, summary_by_mode: dict[str, dict[str, dict[str
                             stats.get("max"),
                             stats.get("n"),
                             "",
+                        ]
+                    )
+        inter_metrics = [
+            "inter_repair_sa_accepted",
+            "inter_repair_sa_n_unknown_in",
+            "inter_repair_sa_n_unknown_out",
+            "inter_repair_sa_elapsed_s",
+            "inter_repair_sa_skip_reason",
+        ]
+        for mode, rows in metrics_by_mode.items():
+            for row in rows:
+                payload = row.to_dict()
+                board = str(payload.get("board", ""))
+                label = str(payload.get("label", ""))
+                for metric in inter_metrics:
+                    writer.writerow(
+                        [
+                            "run",
+                            mode,
+                            board,
+                            f"{label}:{metric}",
+                            "",
+                            "",
+                            "",
+                            "",
+                            payload.get(metric, ""),
                         ]
                     )
         checks = gates.get("checks", {}) if isinstance(gates, dict) else {}
@@ -154,7 +185,18 @@ def main(argv=None) -> int:
         ensure_output_dir(out_root)
 
         boards = build_standard_matrix(seeds=list(args.seeds), board_tokens=list(args.boards))
-        metric_keys = ["coverage", "n_unknown", "mean_abs_error", "total_time_s", "loss_per_cell", "mine_accuracy"]
+        metric_keys = [
+            "coverage",
+            "n_unknown",
+            "mean_abs_error",
+            "total_time_s",
+            "loss_per_cell",
+            "mine_accuracy",
+            "inter_repair_sa_accepted",
+            "inter_repair_sa_n_unknown_in",
+            "inter_repair_sa_n_unknown_out",
+            "inter_repair_sa_elapsed_s",
+        ]
         metrics_by_mode = {}
         summary_by_mode = {}
         reasons_by_mode = {}
@@ -162,7 +204,7 @@ def main(argv=None) -> int:
         t_bench_start = time.perf_counter()
 
         print("=" * 68)
-        print("ITERATION 10 A/B BENCHMARK")
+        print("ITERATION 12 A/B BENCHMARK")
         print("=" * 68)
         print(f"Input image: {img}")
         print(f"Output dir:  {out_root}")
@@ -309,6 +351,10 @@ def main(argv=None) -> int:
             "repair_global_cap_s": args.repair_global_cap_s,
             "summary_by_mode": summary_by_mode,
             "reason_counts_by_mode": reasons_by_mode,
+            "metrics_by_mode": {
+                mode: [m.to_dict() for m in rows]
+                for mode, rows in metrics_by_mode.items()
+            },
             "gates": gates,
             "parallel_jobs": jobs,
             "repair_eval_jobs": int(args.repair_eval_jobs),
@@ -318,7 +364,7 @@ def main(argv=None) -> int:
         summary_json = out_root / "summary_ab.json"
         summary_csv = out_root / "summary_ab.csv"
         summary_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        _write_summary_csv(summary_csv, summary_by_mode, gates)
+        _write_summary_csv(summary_csv, summary_by_mode, gates, metrics_by_mode)
         print(f"Saved benchmark summary JSON: {summary_json}")
         print(f"Saved benchmark summary CSV:  {summary_csv}")
         print(f"Benchmark total elapsed: {time.perf_counter() - t_bench_start:.1f}s")

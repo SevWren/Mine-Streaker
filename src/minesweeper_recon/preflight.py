@@ -38,7 +38,7 @@ def _ps_quote(token: str) -> str:
 
 def parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Iteration 10 Minesweeper reconstruction pipeline (Windows 10 compatible)."
+        description="Iteration 12 Minesweeper reconstruction pipeline (Windows compatible)."
     )
     parser.add_argument(
         "--img",
@@ -48,7 +48,7 @@ def parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--out",
         default=str(defaults.out_dir),
-        help="Directory for output artifacts (default: results/iter10_win10).",
+        help="Directory for output artifacts (default: results/iter12/iter12_win12).",
     )
     parser.add_argument(
         "--solver-mode",
@@ -80,7 +80,7 @@ def parse_args(defaults: PathsConfig, argv=None) -> argparse.Namespace:
         "--board-jobs",
         type=int,
         default=1,
-        help="Number of parallel board workers for iter10_win10 pipeline (default: 1).",
+        help="Number of parallel board workers for iter12 pipeline (default: 1).",
     )
     parser.add_argument(
         "--repair-eval-jobs",

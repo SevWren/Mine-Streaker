@@ -72,6 +72,13 @@ class RepairContext:
     parallel_eval_jobs: int = 1
     parallel_eval_batch_size: int = 0
     failure_policy: str = "fail_fast"
+    phase2_hotspot_top_k: int = 6
+    phase2_hotspot_radius: int = 6
+    phase2_delta_shortlist: int = 24
+    phase2_beam_width: int = 6
+    phase2_beam_depth: int = 2
+    phase2_beam_branch: int = 8
+    phase2_fullsolve_cap: int = 8
 
 
 @dataclass
@@ -117,6 +124,24 @@ class PipelineMetrics:
     deterministic_sort_time_s_total: float = 0.0
     repair_phase1_telemetry: dict[str, Any] = field(default_factory=dict)
     repair_phase2_telemetry: dict[str, Any] = field(default_factory=dict)
+    inter_repair_sa_accepted: bool = False
+    inter_repair_sa_n_unknown_in: int = 0
+    inter_repair_sa_n_unknown_out: int = 0
+    inter_repair_sa_coverage_in: float = 0.0
+    inter_repair_sa_coverage_out: float = 0.0
+    inter_repair_sa_skip_reason: str = ""
+    inter_repair_sa_elapsed_s: float = 0.0
+    pattern_breaker_applied: bool = False
+    pattern_breaker_n_unknown_in: int = 0
+    pattern_breaker_n_unknown_out: int = 0
+    pattern_breaker_coverage_in: float = 0.0
+    pattern_breaker_coverage_out: float = 0.0
+    pattern_breaker_skip_reason: str = ""
+    pattern_breaker_elapsed_s: float = 0.0
+    phase2_hotspot_unknown_scanned: int = 0
+    phase2_beam_candidates: int = 0
+    phase2_heuristic_shortlist: int = 0
+    phase2_finalist_solves: int = 0
     parallel_jobs: int = 1
     parallel_enabled: bool = False
     parallel_tasks_submitted: int = 0
@@ -171,6 +196,24 @@ class PipelineMetrics:
             "deterministic_sort_time_s_total": self.deterministic_sort_time_s_total,
             "repair_phase1_telemetry": self.repair_phase1_telemetry,
             "repair_phase2_telemetry": self.repair_phase2_telemetry,
+            "inter_repair_sa_accepted": self.inter_repair_sa_accepted,
+            "inter_repair_sa_n_unknown_in": self.inter_repair_sa_n_unknown_in,
+            "inter_repair_sa_n_unknown_out": self.inter_repair_sa_n_unknown_out,
+            "inter_repair_sa_coverage_in": self.inter_repair_sa_coverage_in,
+            "inter_repair_sa_coverage_out": self.inter_repair_sa_coverage_out,
+            "inter_repair_sa_skip_reason": self.inter_repair_sa_skip_reason,
+            "inter_repair_sa_elapsed_s": self.inter_repair_sa_elapsed_s,
+            "pattern_breaker_applied": self.pattern_breaker_applied,
+            "pattern_breaker_n_unknown_in": self.pattern_breaker_n_unknown_in,
+            "pattern_breaker_n_unknown_out": self.pattern_breaker_n_unknown_out,
+            "pattern_breaker_coverage_in": self.pattern_breaker_coverage_in,
+            "pattern_breaker_coverage_out": self.pattern_breaker_coverage_out,
+            "pattern_breaker_skip_reason": self.pattern_breaker_skip_reason,
+            "pattern_breaker_elapsed_s": self.pattern_breaker_elapsed_s,
+            "phase2_hotspot_unknown_scanned": self.phase2_hotspot_unknown_scanned,
+            "phase2_beam_candidates": self.phase2_beam_candidates,
+            "phase2_heuristic_shortlist": self.phase2_heuristic_shortlist,
+            "phase2_finalist_solves": self.phase2_finalist_solves,
             "parallel_jobs": self.parallel_jobs,
             "parallel_enabled": self.parallel_enabled,
             "parallel_tasks_submitted": self.parallel_tasks_submitted,
@@ -227,6 +270,24 @@ class PipelineMetrics:
             deterministic_sort_time_s_total=float(payload.get("deterministic_sort_time_s_total", 0.0)),
             repair_phase1_telemetry=dict(payload.get("repair_phase1_telemetry", {})),
             repair_phase2_telemetry=dict(payload.get("repair_phase2_telemetry", {})),
+            inter_repair_sa_accepted=bool(payload.get("inter_repair_sa_accepted", False)),
+            inter_repair_sa_n_unknown_in=int(payload.get("inter_repair_sa_n_unknown_in", 0)),
+            inter_repair_sa_n_unknown_out=int(payload.get("inter_repair_sa_n_unknown_out", 0)),
+            inter_repair_sa_coverage_in=float(payload.get("inter_repair_sa_coverage_in", 0.0)),
+            inter_repair_sa_coverage_out=float(payload.get("inter_repair_sa_coverage_out", 0.0)),
+            inter_repair_sa_skip_reason=str(payload.get("inter_repair_sa_skip_reason", "")),
+            inter_repair_sa_elapsed_s=float(payload.get("inter_repair_sa_elapsed_s", 0.0)),
+            pattern_breaker_applied=bool(payload.get("pattern_breaker_applied", False)),
+            pattern_breaker_n_unknown_in=int(payload.get("pattern_breaker_n_unknown_in", 0)),
+            pattern_breaker_n_unknown_out=int(payload.get("pattern_breaker_n_unknown_out", 0)),
+            pattern_breaker_coverage_in=float(payload.get("pattern_breaker_coverage_in", 0.0)),
+            pattern_breaker_coverage_out=float(payload.get("pattern_breaker_coverage_out", 0.0)),
+            pattern_breaker_skip_reason=str(payload.get("pattern_breaker_skip_reason", "")),
+            pattern_breaker_elapsed_s=float(payload.get("pattern_breaker_elapsed_s", 0.0)),
+            phase2_hotspot_unknown_scanned=int(payload.get("phase2_hotspot_unknown_scanned", 0)),
+            phase2_beam_candidates=int(payload.get("phase2_beam_candidates", 0)),
+            phase2_heuristic_shortlist=int(payload.get("phase2_heuristic_shortlist", 0)),
+            phase2_finalist_solves=int(payload.get("phase2_finalist_solves", 0)),
             parallel_jobs=int(payload.get("parallel_jobs", 1)),
             parallel_enabled=bool(payload.get("parallel_enabled", False)),
             parallel_tasks_submitted=int(payload.get("parallel_tasks_submitted", 0)),

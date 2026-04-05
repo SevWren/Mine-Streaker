@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import multiprocessing as mp
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -128,6 +129,398 @@ def _pipeline_worker_run(index: int, board: BoardConfig, runtime: RuntimeConfig)
         _PIPELINE_WORKER_SA_FN = compile_sa_kernel()
     metrics = _run_board_with_kernel(board, runtime, _PIPELINE_WORKER_SA_FN)
     return index, metrics.to_dict()
+
+
+def _build_unknown_roi_mask(
+    unknown: set[tuple[int, int]],
+    H: int,
+    W: int,
+    ring: int,
+    forbidden: np.ndarray,
+) -> np.ndarray:
+    ring = max(0, int(ring))
+    roi = np.zeros((H, W), dtype=np.int8)
+    if not unknown:
+        return roi
+    for uy, ux in sorted((int(y), int(x)) for y, x in unknown):
+        y0 = max(0, uy - ring)
+        y1 = min(H, uy + ring + 1)
+        x0 = max(0, ux - ring)
+        x1 = min(W, ux + ring + 1)
+        roi[y0:y1, x0:x1] = 1
+    roi[forbidden == 1] = 0
+    return roi
+
+
+def _unknown_clusters(unknown: set[tuple[int, int]], H: int, W: int) -> list[list[tuple[int, int]]]:
+    remaining = {tuple((int(y), int(x))) for y, x in unknown}
+    out: list[list[tuple[int, int]]] = []
+    while remaining:
+        start = min(remaining)
+        remaining.remove(start)
+        q = deque([start])
+        cluster = [start]
+        while q:
+            y, x = q.popleft()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    cand = (ny, nx)
+                    if 0 <= ny < H and 0 <= nx < W and cand in remaining:
+                        remaining.remove(cand)
+                        q.append(cand)
+                        cluster.append(cand)
+        cluster.sort()
+        out.append(cluster)
+    out.sort(key=lambda c: (-len(c), c[0][0], c[0][1]))
+    return out
+
+
+def run_inter_repair_sa(
+    *,
+    grid: np.ndarray,
+    target: np.ndarray,
+    weights: np.ndarray,
+    forbidden: np.ndarray,
+    sr_phase1,
+    sa_fn,
+    solve_fn,
+    config: BoardConfig,
+    runtime: RuntimeConfig,
+    global_deadline_s: float,
+    verbose: bool = False,
+) -> tuple[np.ndarray, object, dict[str, object]]:
+    """
+    Inter-repair warm restart SA - runs between Phase 1 and Phase 2 repair.
+
+    This function must remain module-level for Windows spawn picklability and
+    synchronous (no threading). It consumes the existing global repair deadline
+    budget implicitly without introducing any separate allocation line.
+    """
+    from .runtime import check_deadline, now_s
+
+    _ = runtime  # Explicitly unused in this stage; retained for call-site symmetry.
+    t_start = now_s()
+    H, W = grid.shape
+    n_unk = int(sr_phase1.n_unknown)
+
+    telemetry: dict[str, object] = {
+        "stage": "inter_repair_sa",
+        "n_unknown_in": n_unk,
+        "n_unknown_out": n_unk,
+        "coverage_in": float(sr_phase1.coverage),
+        "coverage_out": float(sr_phase1.coverage),
+        "accepted": False,
+        "skip_reason": "",
+        "elapsed_s": 0.0,
+        "roi_cells": 0,
+    }
+
+    if int(config.inter_repair_sa_iters) <= 0:
+        telemetry["skip_reason"] = "disabled_iters_zero"
+        return grid, sr_phase1, telemetry
+
+    if n_unk == 0:
+        telemetry["skip_reason"] = "already_solved"
+        return grid, sr_phase1, telemetry
+
+    if n_unk > int(config.inter_repair_sa_max_unknown):
+        telemetry["skip_reason"] = (
+            f"n_unknown_exceeds_cap ({n_unk} > {int(config.inter_repair_sa_max_unknown)})"
+        )
+        if verbose:
+            print(f"  [Inter-repair SA]  skipped: {telemetry['skip_reason']}")
+        return grid, sr_phase1, telemetry
+
+    remaining_budget = max(0.0, float(global_deadline_s) - now_s())
+    sa_estimated_cost_s = float(config.inter_repair_sa_iters) / 2_000_000.0 * 25.0
+    if remaining_budget < sa_estimated_cost_s + 15.0:
+        telemetry["skip_reason"] = f"budget_too_tight (remaining={remaining_budget:.1f}s)"
+        if verbose:
+            print(f"  [Inter-repair SA]  skipped: {telemetry['skip_reason']}")
+        return grid, sr_phase1, telemetry
+
+    if verbose:
+        print(
+            f"\n  [Inter-repair SA]  n_unk={n_unk}  "
+            f"T={config.inter_repair_sa_T}  iters={config.inter_repair_sa_iters:,}"
+        )
+
+    boost_radius = 4
+    boost_map = np.zeros((H, W), dtype=np.float32)
+    for uy, ux in sorted((int(y), int(x)) for y, x in sr_phase1.unknown):
+        y0 = max(0, int(uy) - boost_radius)
+        y1 = min(H, int(uy) + boost_radius + 1)
+        x0 = max(0, int(ux) - boost_radius)
+        x1 = min(W, int(ux) + boost_radius + 1)
+        boost_map[y0:y1, x0:x1] += 1.0
+
+    max_boost = float(boost_map.max())
+    if max_boost > 0.0:
+        boost_map /= max_boost
+    roi_mask = _build_unknown_roi_mask(
+        sr_phase1.unknown,
+        H,
+        W,
+        int(getattr(config, "inter_repair_sa_roi_ring", 4)),
+        forbidden,
+    )
+    roi_cells = int(np.sum(roi_mask == 1))
+    telemetry["roi_cells"] = roi_cells
+    if roi_cells <= 0:
+        telemetry["skip_reason"] = "roi_empty"
+        if verbose:
+            print("  [Inter-repair SA]  skipped: roi_empty")
+        return grid, sr_phase1, telemetry
+
+    w_aug = (weights * (1.0 + 3.0 * boost_map)).astype(np.float32)
+    w_aug[roi_mask == 0] *= 0.05
+
+    try:
+        base_grid = grid.copy()
+        grid_warm = base_grid.copy()
+        roi_forbidden = forbidden.copy()
+        roi_forbidden[(roi_mask == 0) & (base_grid == 0)] = 1
+
+        total_iters = int(config.inter_repair_sa_iters)
+        chunk_iters = max(1, int(getattr(config, "inter_repair_sa_chunk_iters", 200_000)))
+        chunk_iters = min(chunk_iters, total_iters)
+        alpha = 0.999997
+        T_min = 0.001
+        T_cur = float(config.inter_repair_sa_T)
+        iters_done = 0
+        chunk_id = 0
+        while iters_done < total_iters:
+            check_deadline(global_deadline_s, "inter_repair_sa")
+            chunk = min(chunk_iters, total_iters - iters_done)
+            N_in = compute_N(grid_warm).astype(np.float32)
+            grid_warm, _, _ = sa_fn(
+                grid_warm.copy(),
+                N_in.copy(),
+                target,
+                w_aug,
+                roi_forbidden,
+                T_cur,
+                alpha,
+                T_min,
+                int(chunk),
+                int(config.border),
+                H,
+                W,
+                int(config.seed + 10 + chunk_id),
+            )
+            # ROI-only stage: keep every non-ROI cell fixed to its Phase 1 value.
+            grid_warm[roi_mask == 0] = base_grid[roi_mask == 0]
+            grid_warm[forbidden == 1] = 0
+            iters_done += chunk
+            chunk_id += 1
+            T_cur = max(T_min, T_cur * (alpha ** max(1, chunk)))
+
+        check_deadline(global_deadline_s, "inter_repair_sa_solve")
+        sr_warm = solve_fn(grid_warm, global_deadline_s)
+    except Exception as exc:
+        telemetry["skip_reason"] = f"exception: {exc}"
+        telemetry["elapsed_s"] = round(now_s() - t_start, 3)
+        if verbose:
+            print(f"  [Inter-repair SA]  exception - reverting: {exc}")
+        return grid, sr_phase1, telemetry
+
+    coverage_ok = float(sr_warm.coverage) >= float(sr_phase1.coverage) - 0.001
+    if coverage_ok:
+        telemetry["accepted"] = True
+        telemetry["n_unknown_out"] = int(sr_warm.n_unknown)
+        telemetry["coverage_out"] = float(sr_warm.coverage)
+        telemetry["elapsed_s"] = round(now_s() - t_start, 3)
+        if verbose:
+            delta_unk = int(n_unk - int(sr_warm.n_unknown))
+            print(
+                f"  [Inter-repair SA]  ACCEPTED  "
+                f"unk {n_unk}->{int(sr_warm.n_unknown)} (delta {delta_unk:+d})  "
+                f"cov {float(sr_phase1.coverage):.4f}->{float(sr_warm.coverage):.4f}  "
+                f"t={float(telemetry['elapsed_s']):.1f}s"
+            )
+        return grid_warm, sr_warm, telemetry
+
+    telemetry["skip_reason"] = (
+        f"coverage_regression ({float(sr_phase1.coverage):.4f}->{float(sr_warm.coverage):.4f})"
+    )
+    telemetry["elapsed_s"] = round(now_s() - t_start, 3)
+    if verbose:
+        print(f"  [Inter-repair SA]  REVERTED  {telemetry['skip_reason']}")
+    return grid, sr_phase1, telemetry
+
+
+def run_deterministic_pattern_breaker(
+    *,
+    grid: np.ndarray,
+    forbidden: np.ndarray,
+    sr_in,
+    solve_fn,
+    config: BoardConfig,
+    global_deadline_s: float,
+    verbose: bool = False,
+) -> tuple[np.ndarray, object, dict[str, object]]:
+    """
+    Deterministic pre-Phase2 pattern breaker for unresolved 50/50-like pockets.
+    Keeps execution synchronous and deterministic by fixed ordering and tie-breaks.
+    """
+    from .runtime import check_deadline, now_s
+
+    t0 = now_s()
+    H, W = grid.shape
+    telemetry: dict[str, object] = {
+        "stage": "pattern_breaker",
+        "applied": False,
+        "n_unknown_in": int(sr_in.n_unknown),
+        "n_unknown_out": int(sr_in.n_unknown),
+        "coverage_in": float(sr_in.coverage),
+        "coverage_out": float(sr_in.coverage),
+        "skip_reason": "",
+        "elapsed_s": 0.0,
+        "evals": 0,
+    }
+
+    if not bool(getattr(config, "pattern_breaker_enabled", True)):
+        telemetry["skip_reason"] = "disabled"
+        return grid, sr_in, telemetry
+    if int(sr_in.n_unknown) <= 0:
+        telemetry["skip_reason"] = "already_solved"
+        return grid, sr_in, telemetry
+    if max(0.0, float(global_deadline_s) - now_s()) < 4.0:
+        telemetry["skip_reason"] = "budget_too_tight"
+        return grid, sr_in, telemetry
+
+    unknown_set = {(int(y), int(x)) for y, x in sr_in.unknown if forbidden[int(y), int(x)] == 0}
+    if not unknown_set:
+        telemetry["skip_reason"] = "no_editable_unknowns"
+        return grid, sr_in, telemetry
+
+    clusters = _unknown_clusters(unknown_set, H, W)
+    cluster_cap = max(1, int(getattr(config, "pattern_breaker_cluster_cap", 12)))
+    clusters = clusters[:cluster_cap]
+
+    scored_cells: list[tuple[int, int, int]] = []
+    revealed = {(int(y), int(x)) for y, x in sr_in.revealed}
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue
+        for y, x in cluster:
+            unk_n = 0
+            rev_n = 0
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if not (0 <= ny < H and 0 <= nx < W):
+                        continue
+                    if (ny, nx) in unknown_set:
+                        unk_n += 1
+                    elif (ny, nx) in revealed:
+                        rev_n += 1
+            score = int(2 * unk_n + rev_n)
+            scored_cells.append((score, y, x))
+
+    if not scored_cells:
+        telemetry["skip_reason"] = "no_pattern_cells"
+        return grid, sr_in, telemetry
+
+    scored_cells = sorted(scored_cells, key=lambda t: (-t[0], t[1], t[2]))
+    eval_cap = max(1, int(getattr(config, "pattern_breaker_max_evals", 12)))
+    best_grid = grid.copy()
+    best_sr = sr_in
+    evals = 0
+    accepted = 0
+
+    for _, y, x in scored_cells:
+        if evals >= eval_cap or accepted >= 2:
+            break
+        check_deadline(global_deadline_s, "pattern_breaker")
+
+        # Deterministic single-cell toggle.
+        desired = 0 if int(best_grid[y, x]) == 1 else 1
+        if desired == 1 and forbidden[y, x] == 1:
+            continue
+        if desired != int(best_grid[y, x]):
+            cand = best_grid.copy()
+            cand[y, x] = desired
+            cand[forbidden == 1] = 0
+            sr_cand = solve_fn(cand, global_deadline_s)
+            evals += 1
+            if (
+                float(sr_cand.coverage) >= float(best_sr.coverage) - 0.001
+                and (
+                    int(sr_cand.n_unknown) < int(best_sr.n_unknown)
+                    or (
+                        int(sr_cand.n_unknown) == int(best_sr.n_unknown)
+                        and float(sr_cand.coverage) > float(best_sr.coverage) + 0.0005
+                    )
+                )
+            ):
+                best_grid = cand
+                best_sr = sr_cand
+                accepted += 1
+                if verbose:
+                    print(
+                        "  [Pattern breaker] ACCEPTED "
+                        f"({y},{x}) -> {desired}  unknown={int(best_sr.n_unknown)} "
+                        f"cov={float(best_sr.coverage):.4f}"
+                    )
+                continue
+
+        # Deterministic paired toggle for 50/50-like symmetry.
+        if evals >= eval_cap:
+            continue
+        paired = []
+        for dy, dx in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+            py, px = y + dy, x + dx
+            if 0 <= py < H and 0 <= px < W and (py, px) in unknown_set and forbidden[py, px] == 0:
+                paired.append((py, px))
+        if not paired:
+            continue
+        py, px = paired[0]
+        cand = best_grid.copy()
+        desired0 = 0 if int(cand[y, x]) == 1 else 1
+        desired1 = 0 if int(cand[py, px]) == 1 else 1
+        if desired0 == 1 and forbidden[y, x] == 1:
+            continue
+        if desired1 == 1 and forbidden[py, px] == 1:
+            continue
+        cand[y, x] = desired0
+        cand[py, px] = desired1
+        cand[forbidden == 1] = 0
+        sr_cand = solve_fn(cand, global_deadline_s)
+        evals += 1
+        if (
+            float(sr_cand.coverage) >= float(best_sr.coverage) - 0.001
+            and (
+                int(sr_cand.n_unknown) < int(best_sr.n_unknown)
+                or (
+                    int(sr_cand.n_unknown) == int(best_sr.n_unknown)
+                    and float(sr_cand.coverage) > float(best_sr.coverage) + 0.0005
+                )
+            )
+        ):
+            best_grid = cand
+            best_sr = sr_cand
+            accepted += 1
+            if verbose:
+                print(
+                    "  [Pattern breaker] ACCEPTED pair "
+                    f"({y},{x}) ({py},{px})  unknown={int(best_sr.n_unknown)} "
+                    f"cov={float(best_sr.coverage):.4f}"
+                )
+
+    telemetry["evals"] = int(evals)
+    telemetry["applied"] = bool(accepted > 0)
+    telemetry["n_unknown_out"] = int(best_sr.n_unknown)
+    telemetry["coverage_out"] = float(best_sr.coverage)
+    telemetry["elapsed_s"] = round(now_s() - t0, 3)
+    if accepted <= 0:
+        telemetry["skip_reason"] = "no_improving_pattern_edit"
+    return best_grid, best_sr, telemetry
 
 
 def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -> PipelineMetrics:
@@ -260,6 +653,8 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
     phase2_elapsed_s = 0.0
     phase1_telemetry: dict[str, float | int] = {}
     phase2_telemetry: dict[str, float | int] = {}
+    inter_sa_telemetry: dict[str, object] = {}
+    pattern_telemetry: dict[str, object] = {}
 
     print(
         "\n  [Repair budget] "
@@ -314,6 +709,42 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
         assert_board_valid(grid, forbidden, f"{config.label} post-repair1")
         analyze_unknowns(grid, sr, target, f"{config.label} after Phase 1")
 
+    # Inter-repair warm SA (Iteration 11): synchronous module-level helper that
+    # consumes remaining time from global_repair_deadline implicitly.
+    if sr.n_unknown > 0:
+        grid, sr, inter_sa_telemetry = run_inter_repair_sa(
+            grid=grid,
+            target=target,
+            weights=weights,
+            forbidden=forbidden,
+            sr_phase1=sr,
+            sa_fn=sa_fn,
+            solve_fn=solve_fn,
+            config=config,
+            runtime=runtime,
+            global_deadline_s=global_repair_deadline,
+            verbose=runtime.verbose,
+        )
+        if bool(inter_sa_telemetry.get("accepted", False)):
+            assert_board_valid(grid, forbidden, f"{config.label} post-inter-repair-sa")
+            assert int(np.sum((grid == 1) & (forbidden == 1))) == 0
+            analyze_unknowns(grid, sr, target, f"{config.label} after Inter-repair SA")
+
+    if sr.n_unknown > 0 and bool(getattr(config, "pattern_breaker_enabled", True)):
+        grid, sr, pattern_telemetry = run_deterministic_pattern_breaker(
+            grid=grid,
+            forbidden=forbidden,
+            sr_in=sr,
+            solve_fn=solve_fn,
+            config=config,
+            global_deadline_s=global_repair_deadline,
+            verbose=runtime.verbose,
+        )
+        if bool(pattern_telemetry.get("applied", False)):
+            assert_board_valid(grid, forbidden, f"{config.label} post-pattern-breaker")
+            assert int(np.sum((grid == 1) & (forbidden == 1))) == 0
+            analyze_unknowns(grid, sr, target, f"{config.label} after Pattern Breaker")
+
     p2_remaining_global = max(0.0, global_repair_deadline - time.perf_counter())
     if sr.n_unknown > 0 and p2_remaining_global > 0.0:
         print(f"\n  [Phase 2 Swap Repair]  budget={p2_remaining_global:.0f}s")
@@ -337,6 +768,13 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
                 parallel_eval_jobs=max(1, int(getattr(runtime, "repair_eval_jobs", 1))),
                 parallel_eval_batch_size=max(0, int(getattr(runtime, "repair_eval_batch_size", 0))),
                 failure_policy=str(getattr(runtime, "failure_policy", "fail_fast")),
+                phase2_hotspot_top_k=int(getattr(config, "phase2_hotspot_top_k", 6)),
+                phase2_hotspot_radius=int(getattr(config, "phase2_hotspot_radius", 6)),
+                phase2_delta_shortlist=int(getattr(config, "phase2_delta_shortlist", 24)),
+                phase2_beam_width=int(getattr(config, "phase2_beam_width", 6)),
+                phase2_beam_depth=int(getattr(config, "phase2_beam_depth", 2)),
+                phase2_beam_branch=int(getattr(config, "phase2_beam_branch", 8)),
+                phase2_fullsolve_cap=int(getattr(config, "phase2_fullsolve_cap", 8)),
             )
         )
         grid = phase2.grid
@@ -447,6 +885,24 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
         deterministic_sort_time_s_total=round(float(solve_stats.get("sort_time_s", 0.0)), 6),
         repair_phase1_telemetry=phase1_telemetry,
         repair_phase2_telemetry=phase2_telemetry,
+        inter_repair_sa_accepted=bool(inter_sa_telemetry.get("accepted", False)),
+        inter_repair_sa_n_unknown_in=int(inter_sa_telemetry.get("n_unknown_in", 0)),
+        inter_repair_sa_n_unknown_out=int(inter_sa_telemetry.get("n_unknown_out", 0)),
+        inter_repair_sa_coverage_in=float(inter_sa_telemetry.get("coverage_in", 0.0)),
+        inter_repair_sa_coverage_out=float(inter_sa_telemetry.get("coverage_out", 0.0)),
+        inter_repair_sa_skip_reason=str(inter_sa_telemetry.get("skip_reason", "")),
+        inter_repair_sa_elapsed_s=float(inter_sa_telemetry.get("elapsed_s", 0.0)),
+        pattern_breaker_applied=bool(pattern_telemetry.get("applied", False)),
+        pattern_breaker_n_unknown_in=int(pattern_telemetry.get("n_unknown_in", 0)),
+        pattern_breaker_n_unknown_out=int(pattern_telemetry.get("n_unknown_out", 0)),
+        pattern_breaker_coverage_in=float(pattern_telemetry.get("coverage_in", 0.0)),
+        pattern_breaker_coverage_out=float(pattern_telemetry.get("coverage_out", 0.0)),
+        pattern_breaker_skip_reason=str(pattern_telemetry.get("skip_reason", "")),
+        pattern_breaker_elapsed_s=float(pattern_telemetry.get("elapsed_s", 0.0)),
+        phase2_hotspot_unknown_scanned=int(phase2_telemetry.get("hotspot_unknown_scanned", 0)),
+        phase2_beam_candidates=int(phase2_telemetry.get("beam_candidates", 0)),
+        phase2_heuristic_shortlist=int(phase2_telemetry.get("heuristic_shortlist", 0)),
+        phase2_finalist_solves=int(phase2_telemetry.get("fullsolve_finalists", 0)),
         parallel_jobs=max(1, int(max(getattr(runtime, "board_jobs", 1), getattr(runtime, "benchmark_jobs", 1)))),
         parallel_enabled=bool(max(getattr(runtime, "board_jobs", 1), getattr(runtime, "benchmark_jobs", 1)) > 1),
         parallel_tasks_submitted=1,
@@ -468,14 +924,14 @@ def _run_board_with_kernel(config: BoardConfig, runtime: RuntimeConfig, sa_fn) -
         grid,
         sr,
         hist_r.tolist(),
-        title=f"Iter 10  {config.label}  corridor={pct:.0f}%  density={grid.mean():.3f}",
-        save_path=f"{paths.out_dir}/iter10_{slug}_FINAL.png",
+        title=f"Iter 12  {config.label}  corridor={pct:.0f}%  density={grid.mean():.3f}",
+        save_path=f"{paths.out_dir}/iter12_{slug}_FINAL.png",
         dpi=120,
     )
 
-    atomic_save_npy(grid, f"{paths.out_dir}/grid_iter10_{slug}_FINAL.npy")
-    atomic_save_npy(target, f"{paths.out_dir}/target_iter10_{slug}_FINAL.npy")
-    atomic_save_json(metrics.to_dict(), f"{paths.out_dir}/metrics_iter10_{slug}_FINAL.json")
+    atomic_save_npy(grid, f"{paths.out_dir}/grid_iter12_{slug}_FINAL.npy")
+    atomic_save_npy(target, f"{paths.out_dir}/target_iter12_{slug}_FINAL.npy")
+    atomic_save_json(metrics.to_dict(), f"{paths.out_dir}/metrics_iter12_{slug}_FINAL.json")
     print("   Saved atomically")
 
     return metrics
@@ -492,7 +948,7 @@ def run_board(config: BoardConfig, runtime: RuntimeConfig) -> PipelineMetrics:
 
 def run_experiment(config: RunConfig) -> list[PipelineMetrics]:
     print("=" * 68)
-    print("ITERATION 10    Mine-Swap Repair for Solvability")
+    print("ITERATION 12    Hotspot-Focused Repair for Solvability")
     print("=" * 68)
     print(f"Input image: {config.runtime.paths.img}")
     print(f"Output dir:  {config.runtime.paths.out_dir}")
@@ -550,7 +1006,7 @@ def run_experiment(config: RunConfig) -> list[PipelineMetrics]:
         m.parallel_tasks_cancelled = int(tasks_cancelled)
 
     print("\n" + "=" * 68)
-    print("ITERATION 10  FINAL SUMMARY")
+    print("ITERATION 12  FINAL SUMMARY")
     print("=" * 68)
     keys = [
         "cells",
@@ -581,5 +1037,5 @@ def run_experiment(config: RunConfig) -> list[PipelineMetrics]:
     for k in keys:
         print(f"{k:<22}" + "".join(f" {str(m.to_dict().get(k,'-'))[:col_w-1]:>{col_w}}" for m in all_metrics))
 
-    print("\nIteration 10 complete")
+    print("\nIteration 12 complete")
     return all_metrics

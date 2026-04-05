@@ -14,7 +14,7 @@ def default_repo_root() -> Path:
 class PathsConfig:
     repo_root: Path = field(default_factory=default_repo_root)
     img: Path = field(default_factory=lambda: default_repo_root() / "assets" / "input_source_image-left.png")
-    out_dir: Path = field(default_factory=lambda: default_repo_root() / "results" / "iter10_win10")
+    out_dir: Path = field(default_factory=lambda: default_repo_root() / "results" / "iter12" / "iter12_win12")
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,21 @@ class BoardConfig:
     repair1_budget_s: Optional[float]
     repair2_budget_s: float
     repair3_max_unknown: int
+    inter_repair_sa_iters: int = 1_000_000
+    inter_repair_sa_T: float = 1.0
+    inter_repair_sa_max_unknown: int = 500
+    inter_repair_sa_roi_ring: int = 4
+    inter_repair_sa_chunk_iters: int = 200_000
+    pattern_breaker_enabled: bool = True
+    pattern_breaker_max_evals: int = 12
+    pattern_breaker_cluster_cap: int = 12
+    phase2_hotspot_top_k: int = 6
+    phase2_hotspot_radius: int = 6
+    phase2_delta_shortlist: int = 24
+    phase2_beam_width: int = 6
+    phase2_beam_depth: int = 2
+    phase2_beam_branch: int = 8
+    phase2_fullsolve_cap: int = 8
 
 
 @dataclass(frozen=True)
