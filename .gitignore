@@ -216,6 +216,24 @@ results/**
 *.tmp
 *.temp
 
+# Archive artifacts
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.tbz
+*.tbz2
+*.txz
+*.bz2
+*.xz
+*.lz
+*.lz4
+*.zst
+*.cab
+*.iso
+
 # Ignore image/design files by default (explicit allowlist below)
 *.png
 *.jpg

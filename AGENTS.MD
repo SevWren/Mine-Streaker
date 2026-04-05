@@ -93,3 +93,13 @@ When metrics conflict, prioritize:
 3. visual fidelity metrics
 
 Do not trade large coverage regressions for small loss improvements.
+
+## Iteration 11 Results
+- Hypothesis: Inter-repair warm SA reduces n_unknown entering Phase 2
+- Primary change: `run_inter_repair_sa()` in `pipeline.py` between Phase 1 and Phase 2
+- Acceptance gate status: FAIL
+- inter_repair_sa_accepted rate: 22.22% (2/9 runs)
+- Median n_unknown delta (inter SA in -> out): 0
+- Median coverage 250x250: 0.9825
+- Median runtime 250x250: 325.3s
+- Decision: REJECTED (runtime gate not met; set `inter_repair_sa_iters = 0` default to disable stage pending next iteration)
