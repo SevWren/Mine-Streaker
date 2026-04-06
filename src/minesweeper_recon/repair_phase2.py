@@ -588,7 +588,8 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
                 beam_candidates += int(beam_total)
                 heuristic_shortlist += len(beam_keys)
 
-                finalist_cap = min(len(beam_keys), fullsolve_cap_cfg, max(1, affordable_solves - 1))
+                budget_limited_cap = max(1, int(max(1.0, remaining_s) / max(avg_solve_s, 0.05) * 0.25))
+                finalist_cap = min(len(beam_keys), fullsolve_cap_cfg, budget_limited_cap)
                 finalist_keys = beam_keys[:finalist_cap]
                 fullsolve_finalists += len(finalist_keys)
 
@@ -653,7 +654,7 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
 
             if not improved:
                 no_improve_outer += 1
-                if no_improve_outer >= 6:
+                if no_improve_outer >= 4:
                     stop_reason = "stagnated"
                     if context.verbose:
                         print(f"  Swap repair stagnated after {outer+1} outer iterations")

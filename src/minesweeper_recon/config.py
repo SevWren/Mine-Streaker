@@ -33,21 +33,21 @@ class BoardConfig:
     repair1_budget_s: Optional[float]
     repair2_budget_s: float
     repair3_max_unknown: int
-    inter_repair_sa_iters: int = 1_000_000
+    inter_repair_sa_iters: int = 400_000
     inter_repair_sa_T: float = 1.0
-    inter_repair_sa_max_unknown: int = 500
+    inter_repair_sa_max_unknown: int = 1_200
     inter_repair_sa_roi_ring: int = 4
-    inter_repair_sa_chunk_iters: int = 200_000
+    inter_repair_sa_chunk_iters: int = 100_000
     pattern_breaker_enabled: bool = True
-    pattern_breaker_max_evals: int = 12
+    pattern_breaker_max_evals: int = 6
     pattern_breaker_cluster_cap: int = 12
     phase2_hotspot_top_k: int = 6
     phase2_hotspot_radius: int = 6
-    phase2_delta_shortlist: int = 24
-    phase2_beam_width: int = 6
+    phase2_delta_shortlist: int = 16
+    phase2_beam_width: int = 4
     phase2_beam_depth: int = 2
-    phase2_beam_branch: int = 8
-    phase2_fullsolve_cap: int = 8
+    phase2_beam_branch: int = 6
+    phase2_fullsolve_cap: int = 4
 
 
 @dataclass(frozen=True)
