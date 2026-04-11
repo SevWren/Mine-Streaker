@@ -1,0 +1,211 @@
+Directory structure:
+└── ingest/
+    ├── diagnostic_comparison.csv
+    ├── diagnostic_summary.json
+    └── diagnostic_verdict.txt
+
+================================================
+FILE: diagnostic_comparison.csv
+================================================
+condition,label,board,coverage_median,n_unknown_median,rt_median,mae_median,n_runs,gate5_pass,overrides
+C0,baseline,250x156,0.9898,342,112.1,0.751,3,False,{}
+C1,no_inter_sa,250x156,0.986,468,114.4,0.7521,3,False,{'inter_repair_sa_iters': 0}
+C2,no_pattern_bk,250x156,0.9898,342,125.0,0.7509,3,False,{'pattern_breaker_enabled': False}
+C3,wider_p2_caps,250x156,0.9898,342,130.3,0.751,3,False,"{'phase2_delta_shortlist': 24, 'phase2_beam_width': 6, 'phase2_beam_branch': 8, 'phase2_fullsolve_cap': 8}"
+C4,no_stages,250x156,0.9859,470,102.4,0.7519,3,False,"{'inter_repair_sa_iters': 0, 'pattern_breaker_enabled': False}"
+C5,no_bk_wide_p2,250x156,0.9898,342,153.1,0.7509,3,False,"{'pattern_breaker_enabled': False, 'phase2_delta_shortlist': 24, 'phase2_beam_width': 6, 'phase2_beam_branch': 8, 'phase2_fullsolve_cap': 8}"
+C6,all_reverted,250x156,0.9859,470,125.7,0.7519,3,False,"{'inter_repair_sa_iters': 0, 'pattern_breaker_enabled': False, 'phase2_delta_shortlist': 24, 'phase2_beam_width': 6, 'phase2_beam_branch': 8, 'phase2_fullsolve_cap': 8}"
+
+
+
+================================================
+FILE: diagnostic_summary.json
+================================================
+{
+  "conditions_run": [
+    "C0",
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+    "C5",
+    "C6"
+  ],
+  "boards": [
+    "250x156"
+  ],
+  "seeds": [
+    300,
+    301,
+    302
+  ],
+  "results": {
+    "C0": {
+      "250x156": {
+        "coverage_median": 0.9898,
+        "n_unknown_median": 342,
+        "rt_median": 112.1,
+        "mae_median": 0.751,
+        "n_runs": 3
+      }
+    },
+    "C1": {
+      "250x156": {
+        "coverage_median": 0.986,
+        "n_unknown_median": 468,
+        "rt_median": 114.4,
+        "mae_median": 0.7521,
+        "n_runs": 3
+      }
+    },
+    "C2": {
+      "250x156": {
+        "coverage_median": 0.9898,
+        "n_unknown_median": 342,
+        "rt_median": 125.0,
+        "mae_median": 0.7509,
+        "n_runs": 3
+      }
+    },
+    "C3": {
+      "250x156": {
+        "coverage_median": 0.9898,
+        "n_unknown_median": 342,
+        "rt_median": 130.3,
+        "mae_median": 0.751,
+        "n_runs": 3
+      }
+    },
+    "C4": {
+      "250x156": {
+        "coverage_median": 0.9859,
+        "n_unknown_median": 470,
+        "rt_median": 102.4,
+        "mae_median": 0.7519,
+        "n_runs": 3
+      }
+    },
+    "C5": {
+      "250x156": {
+        "coverage_median": 0.9898,
+        "n_unknown_median": 342,
+        "rt_median": 153.1,
+        "mae_median": 0.7509,
+        "n_runs": 3
+      }
+    },
+    "C6": {
+      "250x156": {
+        "coverage_median": 0.9859,
+        "n_unknown_median": 470,
+        "rt_median": 125.7,
+        "mae_median": 0.7519,
+        "n_runs": 3
+      }
+    }
+  },
+  "verdict": {
+    "baseline_regressed": true,
+    "single_recoveries": [],
+    "combo_recoveries": [],
+    "root_cause": "UNRESOLVED: no tested condition recovers the 250x156 regression.",
+    "recommendation": "The regression has a root cause not covered by these conditions. Candidates: (1) solver subset_cap truncation during repair, (2) global repair budget allocation (p1 starving p2), (3) a data/seed difference between this run and the original iter12 run. Next step: audit Phase1 elapsed_s and Phase2 elapsed_s in baseline C0 to check if Phase2 is receiving its expected budget."
+  },
+  "condition_descriptions": {
+    "C0": {
+      "label": "baseline",
+      "description": "iter12 defaults \u2014 should reproduce the 250x156 regression",
+      "overrides": {}
+    },
+    "C1": {
+      "label": "no_inter_sa",
+      "description": "Disable inter-repair SA only (A1 reverted). Tests whether SA stage steals enough budget to cause regression.",
+      "overrides": {
+        "inter_repair_sa_iters": "0"
+      }
+    },
+    "C2": {
+      "label": "no_pattern_bk",
+      "description": "Disable pattern-breaker only (A2 reverted). Tests whether pattern-breaker stage steals enough budget.",
+      "overrides": {
+        "pattern_breaker_enabled": "False"
+      }
+    },
+    "C3": {
+      "label": "wider_p2_caps",
+      "description": "Restore all Phase2 caps to pre-iter12 values (B reverted). Tests whether iter12 over-tightened Phase2 search width.",
+      "overrides": {
+        "phase2_delta_shortlist": "24",
+        "phase2_beam_width": "6",
+        "phase2_beam_branch": "8",
+        "phase2_fullsolve_cap": "8"
+      }
+    },
+    "C4": {
+      "label": "no_stages",
+      "description": "Disable both new pipeline stages (A1+A2 reverted), Phase2 unchanged. Tests whether the two stages together steal enough budget.",
+      "overrides": {
+        "inter_repair_sa_iters": "0",
+        "pattern_breaker_enabled": "False"
+      }
+    },
+    "C5": {
+      "label": "no_bk_wide_p2",
+      "description": "No pattern-breaker + wider Phase2 caps (A2+B reverted). Tests interaction between pattern-breaker budget cost and Phase2 width.",
+      "overrides": {
+        "pattern_breaker_enabled": "False",
+        "phase2_delta_shortlist": "24",
+        "phase2_beam_width": "6",
+        "phase2_beam_branch": "8",
+        "phase2_fullsolve_cap": "8"
+      }
+    },
+    "C6": {
+      "label": "all_reverted",
+      "description": "All iter12 changes reverted (A1+A2+B). If this recovers 250x156 but nothing else does, there is an interaction.",
+      "overrides": {
+        "inter_repair_sa_iters": "0",
+        "pattern_breaker_enabled": "False",
+        "phase2_delta_shortlist": "24",
+        "phase2_beam_width": "6",
+        "phase2_beam_branch": "8",
+        "phase2_fullsolve_cap": "8"
+      }
+    }
+  },
+  "elapsed_s": 2771.5,
+  "iter10_baseline_250x156": {
+    "coverage_median": 0.9916,
+    "n_unknown_median": 285.0,
+    "source": "iter13_plan.md section 3.2"
+  },
+  "iter12_regression_250x156": {
+    "coverage_median": 0.9898,
+    "n_unknown_median": 342.0,
+    "source": "iter13_plan.md section 3.2"
+  }
+}
+
+
+================================================
+FILE: diagnostic_verdict.txt
+================================================
+ITER13 REGRESSION DIAGNOSTIC VERDICT
+=====================================
+
+Baseline regressed: True
+Single recoveries:  []
+Combo recoveries:   []
+
+Root cause:
+  UNRESOLVED: no tested condition recovers the 250x156 regression.
+
+Recommendation:
+  The regression has a root cause not covered by these conditions. Candidates: (1) solver subset_cap truncation during repair, (2) global repair budget allocation (p1 starving p2), (3) a data/seed difference between this run and the original iter12 run. Next step: audit Phase1 elapsed_s and Phase2 elapsed_s in baseline C0 to check if Phase2 is receiving its expected budget.
+
+Conditions run: ['C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6']
+Boards: ['250x156']
+Seeds: [300, 301, 302]
+Total time: 2771s
+
+

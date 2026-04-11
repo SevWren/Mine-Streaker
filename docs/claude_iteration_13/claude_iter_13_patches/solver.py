@@ -229,21 +229,7 @@ def _solve_board_fast(
         constraints = list(constraints_map.items())
         if constraints:
             constraints.sort(key=lambda item: len(item[0]))
-            
-            """
-            Step 2 — Fix solver subset_cap under deadline (the secondary factor)
-            
-            Current (halves solver completeness during repair)
-            subset_cap = 2400 if deadline_s is None else 1200
-
-            # Fix: same cap regardless of deadline
-            subset_cap = 2400
-            This makes the repair oracle accurate. 
-            The global repair deadline already governs total time
-            there is no need to also cripple the solver within that deadline.
-            """
-
-            subset_cap = 2400
+            subset_cap = 2400  # iter13: same cap regardless of deadline
             if len(constraints) > subset_cap:
                 constraints = constraints[:subset_cap]
 

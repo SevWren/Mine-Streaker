@@ -255,6 +255,13 @@ results/**
 !**/2-Figure2-LeftMain.aiease.psd
 !**/2-Figure2-LeftMain.aiease.psd.solid.png
 
-
 archive
 archive/
+
+# Previous Iterations (Keep 2-3+ in ingest)
+digest.txt
+Minesweeper-Codebase-Digested.txt
+docs/claude_iteration_1-6/
+docs/claude_iteration_10/
+docs/claude_iteration_8/
+docs/claude_iteration_9/

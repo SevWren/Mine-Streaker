@@ -48,7 +48,10 @@ class BoardConfig:
     phase2_beam_depth: int = 2
     phase2_beam_branch: int = 6
     phase2_fullsolve_cap: int = 4
-    phase2_scan_unknown_cap: int = 512
+    # iter13: stagnation exit control and mine search width
+    phase2_stagnation_rounds: int = 8
+    phase2_max_mines: int = 24
+
 
 @dataclass(frozen=True)
 class RuntimeConfig:

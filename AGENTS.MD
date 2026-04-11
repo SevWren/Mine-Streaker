@@ -103,3 +103,11 @@ Do not trade large coverage regressions for small loss improvements.
 - Median coverage 250x250: 0.9825
 - Median runtime 250x250: 325.3s
 - Decision: REJECTED (runtime gate not met; set `inter_repair_sa_iters = 0` default to disable stage pending next iteration)
+
+## Invalid PowerShell Commands (Observed)
+
+The following commands failed in PowerShell because `nl` is not available as a native command:
+
+- `nl -ba D:\Github\Minesweeper-Draft\src\minesweeper_recon\repair_phase1.py | Select-Object -First 260`
+- `nl -ba D:\Github\Minesweeper-Draft\src\minesweeper_recon\repair_phase2.py | Select-Object -First 360`
+- `nl -ba D:\Github\Minesweeper-Draft\src\minesweeper_recon\parallel_eval.py | Select-Object -First 240`

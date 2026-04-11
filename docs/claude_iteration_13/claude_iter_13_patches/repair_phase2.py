@@ -229,16 +229,12 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
     fullsolve_finalists = 0
 
     max_outer = context.max_outer or 200
-    max_mines = 16
+    max_mines = int(getattr(context, "phase2_max_mines", 24))
     max_targets = 96
-    max_scored_swaps = 160
+    max_scored_swaps = 240  # iter13: scaled with max_mines
     max_swap_eval = 12
     max_remove_eval = 8
-    #Backup Of Iter12 
-    #scan_unknown_cap = min(len(unknown_list), 512)
-    
-    scan_unknown_cap = 512
-
+    scan_unknown_cap = 256
     hotspot_top_k = max(1, int(getattr(context, "phase2_hotspot_top_k", 6)))
     hotspot_radius = max(1, int(getattr(context, "phase2_hotspot_radius", 6)))
     delta_shortlist_cap = max(1, int(getattr(context, "phase2_delta_shortlist", 24)))
@@ -399,18 +395,8 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
                 unknown_list,
                 top_k=hotspot_top_k,
                 radius=hotspot_radius,
-
-                # Claude Suggested Change
-                # https://claude.ai/chat/0d7e8d5d-0d7a-4abb-9918-f4016cceb400
-                # Using min(n_unknown, 512) rather than just n_unknown keeps a ceiling for very large unknown sets
-                # where full scanning would be expensive. At 342 unknowns this means all 342 are scanned.
-                # At 1,000 unknowns the cap of 512 still provides 50% coverage — better than the current 74.9%
-                # at 342 that's already causing failure. The cap should be exposed as a BoardConfig knob so future
-                # iterations can tune it without source edits.
-                
-                cap=min(len(unknown_list), scan_unknown_cap),
+                cap=scan_unknown_cap,
             )
-
             hotspot_unknown_scanned += len(scan_unknown)
 
             t_stage = now_s()
@@ -668,7 +654,7 @@ def run_phase2_swap_repair(context: RepairContext) -> RepairResult:
 
             if not improved:
                 no_improve_outer += 1
-                if no_improve_outer >= 4:
+                if no_improve_outer >= int(getattr(context, "phase2_stagnation_rounds", 8)):
                     stop_reason = "stagnated"
                     if context.verbose:
                         print(f"  Swap repair stagnated after {outer+1} outer iterations")
